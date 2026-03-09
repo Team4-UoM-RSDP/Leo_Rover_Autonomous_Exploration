@@ -67,6 +67,7 @@ The script installs ROS 2 Jazzy packages (Nav2, SLAM Toolbox, TF2, `ros_gz`), Ga
 ### 2. Build
 
 ```bash
+pkill -f "gz sim" ; pkill -f nav2 ; pkill -f slam ; pkill -f frontier ; pkill -f rviz2 sleep 3
 cd leo_exploration_ws
 source /opt/ros/jazzy/setup.bash
 colcon build --packages-select leo_exploration
