@@ -222,6 +222,7 @@ class FrontierExplorer(Node):
 
         # Drive-forward attempt counter (Bug 15: too-close oscillation escape)
         self._fwd_attempts: int = 0
+        self._fwd_t0: Optional[float] = None
 
         # Bug 4: ensure _state_complete executes exactly once
         self._completed: bool = False
@@ -515,7 +516,7 @@ class FrontierExplorer(Node):
 
     def _drive_forward(self, speed: float = 0.15, duration: float = 3.0) -> None:
         """Drive forward for `duration` seconds, then return to SELECT_FRONTIER."""
-        if not hasattr(self, '_fwd_t0') or self._fwd_t0 is None:
+        if self._fwd_t0 is None:
             self._fwd_t0 = self._now_sec()
             self.get_logger().info(f"Driving forward at {speed} m/s for {duration}s")
         elapsed = self._now_sec() - self._fwd_t0
@@ -1098,7 +1099,7 @@ class FrontierExplorer(Node):
         # retreat mechanism can eventually trigger.
         if not scored:
             # If a drive-forward is already in progress, just continue it
-            if hasattr(self, '_fwd_t0') and self._fwd_t0 is not None:
+            if self._fwd_t0 is not None:
                 self._drive_forward(speed=0.15, duration=3.0)
                 return
 
