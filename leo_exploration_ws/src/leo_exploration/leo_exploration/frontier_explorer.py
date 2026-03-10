@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
 Leo Rover Frontier-Based Autonomous Exploration Node
-ROS2 Jazzy  |  v2.6
+ROS2 Jazzy  |  v2.7
+
+Changelog v2.7 (too-close oscillation escape):
+  Bug 15 - When all detected frontiers are closer than 0.5 m the robot
+            previously drove forward indefinitely without ever escalating.
+            Now: after 2 consecutive drive-forward attempts without finding
+            reachable frontiers the robot switches to a recovery spin
+            (rotation in place) to expose frontiers in new directions.
+            Each "all too close" cycle also increments consec_fail so the
+            existing retreat mechanism (Bug 14) can eventually trigger,
+            preventing permanent back-and-forth oscillation.
 
 Changelog v2.6 (stuck-in-corner escape):
   Bug 14 - RETREATING state: when the robot accumulates too many consecutive
@@ -209,6 +219,9 @@ class FrontierExplorer(Node):
         # Retreat bookkeeping (Bug 14: stuck-in-corner escape)
         self._retreat_goal: Optional[Tuple[float, float]] = None
         self._retreat_t0: Optional[float] = None
+
+        # Drive-forward attempt counter (Bug 15: too-close oscillation escape)
+        self._fwd_attempts: int = 0
 
         # Bug 4: ensure _state_complete executes exactly once
         self._completed: bool = False
@@ -511,6 +524,7 @@ class FrontierExplorer(Node):
         else:
             self._stop()
             self._fwd_t0 = None
+            self._fwd_attempts += 1
             self.state = State.SELECT_FRONTIER
 
     # -------------------------------------------------------------------------
@@ -1079,14 +1093,37 @@ class FrontierExplorer(Node):
         self._publish_frontiers(scored[:20])
 
         # All frontiers too close (filtered out by _score_frontiers)
+        # Bug 15: track drive-forward attempts and escalate to recovery
+        # spin after repeated failures, incrementing consec_fail so the
+        # retreat mechanism can eventually trigger.
         if not scored:
+            # If a drive-forward is already in progress, just continue it
+            if hasattr(self, '_fwd_t0') and self._fwd_t0 is not None:
+                self._drive_forward(speed=0.15, duration=3.0)
+                return
+
+            # Escalate: after 2 completed drive-forwards without finding
+            # valid frontiers, switch to a recovery spin so the robot
+            # rotates and discovers frontiers in new directions.
+            if self._fwd_attempts >= 2:
+                self.get_logger().warn(
+                    f"All frontiers too close after {self._fwd_attempts} "
+                    "forward drives — switching to recovery spin"
+                )
+                self._fwd_attempts = 0
+                self.consec_fail += 1
+                self.state = State.RECOVERING
+                return
+
             self.get_logger().warn(
                 "All frontiers too close — driving forward to explore"
             )
+            self.consec_fail += 1
             self._drive_forward(speed=0.15, duration=3.0)
             return
 
         best = scored[0]
+        self._fwd_attempts = 0  # Bug 15: reset drive-forward counter
         self.get_logger().info(
             f"Best frontier: ({best.cx:.2f}, {best.cy:.2f})  "
             f"size={best.size}  score={best.score:.3f}"
