@@ -1013,6 +1013,7 @@ class FrontierExplorer(Node):
         if self._nav_done:
             if self._nav_ok:
                 self.consec_fail = 0
+                self._current_goal = None
             else:
                 self.consec_fail += 1
                 self.total_fail  += 1
