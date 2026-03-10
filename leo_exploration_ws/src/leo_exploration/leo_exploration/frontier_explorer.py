@@ -1256,10 +1256,12 @@ class FrontierExplorer(Node):
                 self.get_logger().warn(
                     "Retreat navigation failed — recovery spin"
                 )
-                self.consec_fail = 0
             self._retreat_goal = None
             self._nav_done = False
-            self.state = State.SELECT_FRONTIER
+            self.state = (
+                State.SELECT_FRONTIER if self._nav_ok
+                else State.RECOVERING
+            )
             return
 
         # Timeout (generous: configurable via retreat_timeout, default 60 s)
