@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
 Leo Rover Frontier-Based Autonomous Exploration Node
-ROS2 Jazzy  |  v2.5
+ROS2 Jazzy  |  v3.0
+
+Changelog v3.0 (anti-ghost-wall: eliminate in-place rotation):
+  Bug 14 - Removed INIT_SPIN: 360° lidar sees full surroundings without
+            spinning. The 12.5 s in-place rotation injected massive angular
+            odometry noise into SLAM, seeding false loop-closure matches.
+  Bug 15 - RECOVERING rewritten: pure in-place spin replaced with
+            forward-drive + gentle arc turn. Maintains good odometry quality.
+  Bug 16 - AVOIDING phase-1 rewritten: pure spin replaced with forward
+            arc turn (0.05 m/s + 0.5 rad/s). Avoids SLAM-confusing
+            stationary rotation.
+  Bug 17 - Goal orientation set to bearing-toward-frontier instead of
+            hardcoded yaw=0. Prevents Nav2 from rotating to face east at
+            every goal arrival.
+  Bug 18 - Scoring weights rebalanced: direction 0.25→0.35, info_gain
+            0.35→0.25. Strongly prefers forward frontiers, reducing the
+            need for large heading changes that trigger in-place rotation.
 
 Changelog v2.5 (anti-ghost-wall: TF jump detection):
   Bug 13 - TF jump detection: monitors map→odom transform for sudden large
@@ -116,11 +132,11 @@ COSTMAP_LETHAL_THRESH = 70   # range 0-100 (nav2 scale)
 # =============================================================================
 
 class State(Enum):
-    INIT_SPIN       = auto()   # Initial 360 spin to seed SLAM map
+    INIT_SPIN       = auto()   # (LEGACY — skipped in v3.0) Initial spin
     SELECT_FRONTIER = auto()   # Pick best frontier and dispatch Nav2 goal
     NAVIGATING      = auto()   # Waiting for Nav2 to reach goal
-    AVOIDING        = auto()   # Composite avoidance: back-up then spin
-    RECOVERING      = auto()   # Slow spin to expose new frontiers
+    AVOIDING        = auto()   # Composite avoidance: back-up then arc turn
+    RECOVERING      = auto()   # Forward-drive + arc to expose new frontiers
     COMPLETE        = auto()   # All frontiers exhausted
 
 
@@ -155,7 +171,7 @@ class FrontierExplorer(Node):
         self._load_params()
 
         # Runtime state
-        self.state: State                           = State.INIT_SPIN
+        self.state: State                           = State.SELECT_FRONTIER  # Bug 14: skip INIT_SPIN
         self.map_data: Optional[OccupancyGrid]      = None
         self.costmap_data: Optional[OccupancyGrid]  = None   # P1
         self.latest_scan: Optional[LaserScan]       = None
@@ -180,10 +196,11 @@ class FrontierExplorer(Node):
 
         # Avoidance bookkeeping
         self._avoid_t0: Optional[float] = None
-        self._avoid_phase: int          = 0   # 0=back-up, 1=spin
+        self._avoid_phase: int          = 0   # 0=back-up, 1=arc-turn
 
-        # Recovery bookkeeping
+        # Recovery bookkeeping  (Bug 15: forward + arc, no pure spin)
         self._recov_t0: Optional[float] = None
+        self._recov_phase: int          = 0   # 0=clear costmaps, 1=forward, 2=arc
 
         # Visited frontier history (bounded deque)
         self._visited: Deque[Tuple[float, float]] = deque(maxlen=24)
@@ -272,7 +289,7 @@ class FrontierExplorer(Node):
             "\n"
             "╔══════════════════════════════════════════════╗\n"
             "║  Leo Rover Frontier Explorer  (ROS2 Jazzy)   ║\n"
-            "║  v2.0  -  starting initial 360 spin...       ║\n"
+            "║  v3.0  —  no-spin exploration                ║\n"
             "║  Publish False to /explore/enable to pause.  ║\n"
             "╚══════════════════════════════════════════════╝"
         )
@@ -835,11 +852,11 @@ class FrontierExplorer(Node):
                 0.35, 0.0
             )
 
-        # Bug 9: rebalanced scoring weights
+        # Bug 18: direction-biased scoring weights (prefer forward frontiers)
         scores = (
-            0.35 * info_scores
+            0.25 * info_scores
             + 0.30 * dist_scores
-            + 0.25 * dir_scores
+            + 0.35 * dir_scores
             - visit_pens
             - fail_dir_pens
         )
@@ -872,7 +889,10 @@ class FrontierExplorer(Node):
         goal.pose.header.stamp       = self.get_clock().now().to_msg()
         goal.pose.pose.position.x    = fx
         goal.pose.pose.position.y    = fy
-        goal.pose.pose.orientation.w = 1.0
+        # Bug 17: orient toward frontier instead of hardcoded yaw=0
+        goal_yaw = math.atan2(fy - self.ry, fx - self.rx)
+        goal.pose.pose.orientation.z = math.sin(goal_yaw / 2.0)
+        goal.pose.pose.orientation.w = math.cos(goal_yaw / 2.0)
 
         self._nav_done = False
         self._nav_ok   = False
@@ -1054,30 +1074,13 @@ class FrontierExplorer(Node):
             return
 
         {
-            State.INIT_SPIN:       self._state_init_spin,
+            State.INIT_SPIN:       self._state_select,   # Bug 14: INIT_SPIN skipped, goes straight to select
             State.SELECT_FRONTIER: self._state_select,
             State.NAVIGATING:      self._state_navigating,
             State.AVOIDING:        self._state_avoiding,
             State.RECOVERING:      self._state_recovering,
             State.COMPLETE:        self._state_complete,
         }[self.state](now)
-
-    # -------------------------------------------------------------------------
-    #  State: INIT_SPIN
-    # -------------------------------------------------------------------------
-
-    def _state_init_spin(self, now: float) -> None:
-        if self._spin_t0 is None:
-            self._spin_t0 = now
-            self.get_logger().info("Initial 360 spin started...")
-
-        if now - self._spin_t0 < self.p_spin_duration:
-            self._spin()
-        else:
-            self._stop()
-            self._spin_t0 = None
-            self.get_logger().info("Initial spin done - starting exploration")
-            self.state = State.SELECT_FRONTIER
 
     # -------------------------------------------------------------------------
     #  State: SELECT_FRONTIER
@@ -1188,7 +1191,7 @@ class FrontierExplorer(Node):
             self.state = State.SELECT_FRONTIER
 
     # -------------------------------------------------------------------------
-    #  State: AVOIDING
+    #  State: AVOIDING  (Bug 16: arc turn instead of pure spin)
     # -------------------------------------------------------------------------
 
     def _state_avoiding(self, now: float) -> None:
@@ -1198,15 +1201,15 @@ class FrontierExplorer(Node):
             if elapsed < self.p_backup_dur:
                 self._drive(self.p_backup_speed)
             else:
-                # Transition to spin; reset t0 BEFORE next tick (Bug 6 from prev)
+                # Transition to arc turn; reset t0
                 self._avoid_phase = 1
                 self._avoid_t0    = now
-                self._spin(self.p_spin_speed * 1.4)   # start immediately
+                self._drive(0.05, 0.5)   # Bug 16: arc turn (forward + rotate)
         else:
-            # Phase 1: spin to clear obstacle; elapsed measured from new t0
+            # Phase 1: arc turn to clear obstacle
             elapsed = now - (self._avoid_t0 or now)
             if elapsed < self.p_avoid_spin_dur:
-                self._spin(self.p_spin_speed * 1.4)
+                self._drive(0.05, 0.5)   # Bug 16: gentle arc, NOT pure spin
             else:
                 self._stop()
                 self.get_logger().info("Avoidance manoeuvre complete")
@@ -1215,21 +1218,46 @@ class FrontierExplorer(Node):
                 self.state = State.SELECT_FRONTIER
 
     # -------------------------------------------------------------------------
-    #  State: RECOVERING
+    #  State: RECOVERING  (Bug 15: forward + arc, no pure spin)
     # -------------------------------------------------------------------------
 
     def _state_recovering(self, now: float) -> None:
         if self._recov_t0 is None:
-            self._recov_t0 = now
-            self.get_logger().info("Recovery spin...")
+            self._recov_t0    = now
+            self._recov_phase = 0
+            self._clear_costmaps()
+            self.get_logger().info("Recovery: clear costmaps → forward → arc")
 
-        if now - self._recov_t0 < self.p_recov_spin_dur:
-            self._spin()
-        else:
-            self._stop()
-            self._recov_t0 = None
-            self.get_logger().info("Recovery spin done")
-            self.state = State.SELECT_FRONTIER
+        elapsed = now - self._recov_t0
+
+        if self._recov_phase == 0:
+            # Phase 0: wait 0.5 s for costmap clear to propagate
+            if elapsed >= 0.5:
+                self._recov_phase = 1
+                self._recov_t0 = now
+
+        elif self._recov_phase == 1:
+            # Phase 1: drive forward slowly for 2 s (stop if obstacle)
+            elapsed = now - self._recov_t0
+            obs, dist = self._obstacle_in_sector()
+            if elapsed < 2.0 and not (obs and dist < self.p_obs_dist):
+                self._drive(0.10)
+            else:
+                # Transition to arc turn
+                self._recov_phase = 2
+                self._recov_t0 = now
+
+        elif self._recov_phase == 2:
+            # Phase 2: gentle arc turn for 2 s (forward + rotate)
+            elapsed = now - self._recov_t0
+            if elapsed < 2.0:
+                self._drive(0.05, 0.4)
+            else:
+                self._stop()
+                self._recov_t0    = None
+                self._recov_phase = 0
+                self.get_logger().info("Recovery manoeuvre done")
+                self.state = State.SELECT_FRONTIER
 
     # -------------------------------------------------------------------------
     #  State: COMPLETE  (Bug 4: exactly-once guard)

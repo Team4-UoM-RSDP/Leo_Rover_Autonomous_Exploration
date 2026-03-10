@@ -46,7 +46,7 @@ slam_toolbox:
     link_match_minimum_response_fine:  0.1
     link_scan_maximum_distance:        1.5
     loop_search_maximum_distance:      2.0    # was 3.0 — reduced to limit false matches in symmetric environments
-    do_loop_closing:                   true
+    do_loop_closing:                   false   # DISABLED — prevents rotated map artifacts in symmetric environments
     loop_match_minimum_chain_size:     15     # was 10 — require more consistent matches to accept a loop closure
     loop_match_maximum_variance_coarse: 3.0
     loop_match_minimum_response_coarse: 0.65   # was 0.45 — aggressively tightened to reject 90° rotation false positives
