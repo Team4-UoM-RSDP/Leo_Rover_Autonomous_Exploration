@@ -18,6 +18,8 @@ from sensor_msgs.msg import LaserScan
 class LidarFilter(Node):
     def __init__(self):
         super().__init__('lidar_filter')
+        # Ensure sim time works
+        self.declare_parameter('use_sim_time', False)
         self.declare_parameter('lidar_fov_deg', 120.0)
         
         fov_deg = self.get_parameter('lidar_fov_deg').value
