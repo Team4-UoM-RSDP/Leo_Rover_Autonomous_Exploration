@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
 Leo Rover Frontier-Based Autonomous Exploration Node
-ROS2 Jazzy  |  v5.0
+ROS2 Jazzy  |  v6.0
+
+Changelog v6.0 (anti-shark-trap):
+  Bug 21 - Nav2 `use_rotate_to_heading` re-enabled but restricted to >143°
+           for dead-end U-turns only.
+  Bug 22 - Added obstacle detection to `_drive_forward`. Stops and recovers
+           instead of pushing against walls when all frontiers are filtered.
+  Bug 23 - `RECOVERING` phase 2 changed to a very tight/slow spin to escape
+           dead-ends where arc turns are impossible.
 
 Changelog v5.0 (first-principles anti-ghost-wall):
   Bug 19 - 120° front-facing lidar filter: publishes /scan_filtered with
@@ -287,7 +295,7 @@ class FrontierExplorer(Node):
             "\n"
             "╔══════════════════════════════════════════════╗\n"
             "║  Leo Rover Frontier Explorer  (ROS2 Jazzy)   ║\n"
-            "║  v5.0  —  120° lidar + zero-spin             ║\n"
+            "║  v6.0  —  shark-trap fix                     ║\n"
             "║  Publish False to /explore/enable to pause.  ║\n"
             "╚══════════════════════════════════════════════╝"
         )
@@ -591,22 +599,26 @@ class FrontierExplorer(Node):
         self._cmd_vel_pub.publish(t)
 
     def _drive_forward(self, speed: float = 0.15, duration: float = 3.0) -> None:
-        """Drive forward for `duration` seconds, then return to SELECT_FRONTIER.
-        Bug 21: added obstacle safety check — stops immediately if wall ahead.
-        """
+        """Drive forward for `duration` seconds, then return to SELECT_FRONTIER."""
         if not hasattr(self, '_fwd_t0') or self._fwd_t0 is None:
             self._fwd_t0 = self._now_sec()
             self.get_logger().info(f"Driving forward at {speed} m/s for {duration}s")
         elapsed = self._now_sec() - self._fwd_t0
-        # Bug 21: check for obstacle before driving
+
+        # Bug 22: Added obstacle detection to blind drive-forward
         obs, dist = self._obstacle_in_sector()
-        if elapsed < duration and not (obs and dist < self.p_obs_dist):
+        if obs and dist < self.p_obs_dist:
+            self.get_logger().warn(f"Obstacle blocks forward drive! Entering recovery.")
+            self._stop()
+            self._fwd_t0 = None
+            self.state = State.RECOVERING
+            return
+
+        if elapsed < duration:
             self._drive(speed)
         else:
             self._stop()
             self._fwd_t0 = None
-            if obs:
-                self.get_logger().info("Forward drive stopped — obstacle ahead")
             self.state = State.SELECT_FRONTIER
 
     # -------------------------------------------------------------------------
@@ -1168,18 +1180,10 @@ class FrontierExplorer(Node):
 
         # All frontiers too close (filtered out by _score_frontiers)
         if not scored:
-            # Bug 21: DON'T drive blindly forward — check for obstacle first
-            obs, dist = self._obstacle_in_sector()
-            if obs and dist < self.p_obs_dist:
-                self.get_logger().warn(
-                    "All frontiers too close & obstacle ahead — entering recovery"
-                )
-                self.state = State.RECOVERING
-            else:
-                self.get_logger().warn(
-                    "All frontiers too close — safe short forward drive"
-                )
-                self._drive_forward(speed=0.10, duration=2.0)
+            self.get_logger().warn(
+                "All frontiers too close — driving forward to explore"
+            )
+            self._drive_forward(speed=0.15, duration=3.0)
             return
 
         best = scored[0]

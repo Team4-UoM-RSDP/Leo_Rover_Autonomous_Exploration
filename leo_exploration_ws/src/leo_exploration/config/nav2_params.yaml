@@ -80,9 +80,9 @@ controller_server:
       use_cost_regulated_linear_velocity_scaling: false
       regulated_linear_scaling_min_radius: 0.9
       regulated_linear_scaling_min_speed: 0.25
-      use_rotate_to_heading: false        # DISABLED — no in-place rotation, always arc. Prevents SLAM confusion.
+      use_rotate_to_heading: true         # Bug 21: Re-enabled for dead-end U-turns ONLY
       allow_reversing: false
-      rotate_to_heading_min_angle: 1.57    # only rotate in-place for >90° (was 45°) — reduces SLAM noise
+      rotate_to_heading_min_angle: 2.5    # Bug 21: Only rotate in-place for >143° (U-turns). Protects SLAM in 90° corners.
       max_angular_accel: 3.2
       max_robot_pose_search_dist: 10.0
 
