@@ -17,7 +17,7 @@ slam_toolbox:
     odom_frame:       odom
     map_frame:        map
     base_frame:       base_link
-    scan_topic:       /scan
+    scan_topic:       /scan_filtered
     use_map_saver:    false
     mode:             mapping          # mapping | localization
 
@@ -45,12 +45,12 @@ slam_toolbox:
     scan_buffer_maximum_scan_distance: 10.0
     link_match_minimum_response_fine:  0.1
     link_scan_maximum_distance:        1.5
-    loop_search_maximum_distance:      3.0
+    loop_search_maximum_distance:      2.0
     do_loop_closing:                   true
     loop_match_minimum_chain_size:     10
     loop_match_maximum_variance_coarse: 3.0
-    loop_match_minimum_response_coarse: 0.45   # was 0.35 — tightened to reject weak loop closures
-    loop_match_minimum_response_fine:   0.55   # was 0.45 — tightened to prevent map jumps
+    loop_match_minimum_response_coarse: 0.55   # was 0.45 — tightened further to reject weak loop closures
+    loop_match_minimum_response_fine:   0.65   # was 0.55 — tightened further to prevent map jumps
 
     # ── Correlation parameters ────────────────────────────────────────────────
     correlation_search_space_dimension:    0.5

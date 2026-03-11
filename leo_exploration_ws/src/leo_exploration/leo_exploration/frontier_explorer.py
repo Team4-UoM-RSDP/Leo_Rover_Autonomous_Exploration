@@ -1,72 +1,24 @@
 #!/usr/bin/env python3
 """
 Leo Rover Frontier-Based Autonomous Exploration Node
-ROS2 Jazzy  |  v2.4
+ROS2 Jazzy  |  v3.0
 
-Changelog v2.4 (adaptive blacklisting & scoring rebalance):
-  Bug 7  - Adaptive blacklist radius: base radius (2.0 m) scales up with
-            consecutive failures via factor (1 + 0.3 * consec_fail), so the
-            robot avoids wider areas around repeatedly unreachable goals.
-  Bug 8  - Failure-direction penalty: bearings toward failed goals are
-            tracked; frontiers within 30° of a recent failure bearing are
-            penalised, preventing the robot from circling in the same
-            direction.
-  Bug 9  - Scoring weight rebalance: info_gain 0.45→0.35, distance
-            0.35→0.30, direction 0.15→0.25.  Increased direction weight
-            steers the robot toward unexplored headings rather than fixating
-            on high-info-gain frontiers that may be unreachable.
-  Bug 10 - Stronger revisit penalty: 0.40 within 0.6 m → 0.55 within
-            1.0 m.  Discourages circling over already-visited territory.
-  Bug 11 - Random score perturbation (±0.15) after 2+ consecutive failures
-            breaks deterministic re-selection of the same frontier.
-  Bug 12 - Blacklist capacity raised 50→100, duration 120→300 s, default
-            radius 1.0→2.0 m for more effective exclusion of stuck regions.
-
-Changelog v2.3 (frontier blacklisting):
-  Bug 6  - Unreachable goal blacklist: when Nav2 fails to plan or navigate
-            to a frontier, its coordinates are added to a time-decaying
-            blacklist. Frontiers within blacklist_radius (default 1.0 m) of
-            any blacklisted point are excluded from selection, preventing
-            the robot from repeatedly targeting the same unreachable goal.
-
-Changelog v2.2 (performance optimizations round 2):
-  Perf 5 - Scan array caching: _obstacle_in_sector() caches numpy arrays
-            (ranges + angles) to avoid O(n) conversion every 5 Hz tick.
-  Perf 6 - Single-pass map stats: _map_stats() uses np.bincount instead of
-            three separate np.sum calls, reducing passes over the array.
-  Perf 7 - Costmap array caching: _get_costmap_array() caches numpy
-            conversion, mirroring the map cache strategy.
-  Perf 8 - Batched inflation filter: _filter_frontiers_by_costmap() checks
-            all frontier centroids in one vectorized numpy operation instead
-            of per-frontier Python calls.
-  Perf 9 - Removed dead visited-list trimming code in _score_frontiers()
-            (deque maxlen=24 makes the len>50 check unreachable).
-
-Changelog v2.1 (performance optimizations):
-  Perf 1 - Map array caching: _get_map_array() caches numpy conversion,
-            avoiding O(w*h) conversion on every control loop iteration.
-  Perf 2 - Vectorized frontier scoring: _score_frontiers() uses numpy
-            for batch distance, angle, and penalty calculations.
-  Perf 3 - Vectorized centroid calculation: uses numpy array operations
-            instead of Python sum() for cluster centroid computation.
-  Perf 4 - Optimized BFS iteration: direct numpy array indexing instead
-            of converting to Python lists with .tolist().
-
-Changelog v2.0 (analysis_report.md fixes applied):
-  Bug 1  - Extract _map_stats() helper: _log_progress / _explored_pct share
-            one code path (DRY, single source of truth).
-  Bug 2  - np.roll replaced with np.pad dilation: no edge-wrap artefacts that
-            produced spurious frontier detections along map borders.
-  Bug 3  - _clear_costmaps: blocking wait_for_service removed from control
-            loop; service readiness tracked by a separate 1 Hz timer.
-  Bug 4  - _state_complete guarded by _completed flag -> prints exactly once.
-  Bug 5  - All timing uses _now_sec() (ROS clock) -> sim_time-compatible;
-            time.monotonic() fully removed.
-  P1     - Frontier reachability filter: centroids inside costmap
-            inflation/lethal zone (cost >= COSTMAP_LETHAL_THRESH) discarded.
-  P1     - Subscribe /global_costmap/costmap for the inflation filter.
-  P2     - Map auto-saved on COMPLETE via nav2_map_server map_saver_cli.
-  P2     - Stop/resume via Bool topic /explore/enable.
+Changelog v3.0 (ghost-wall fix & roomba-style exploration):
+  - REMOVED: INIT_SPIN state — no initial 360° spin; exploration begins
+    immediately.  This prevents the symmetric scan pattern that confuses
+    SLAM loop closure when transitioning to a new area.
+  - REMOVED: RECOVERING spin — replaced by WANDERING state that drives
+    forward with a gentle random arc (like a robot vacuum).
+  - REMOVED: Pure in-place spins everywhere — AVOIDING now uses arc-turns
+    (backup + forward-arc) instead of backup + spin.
+  - ADDED: 120° front-facing LiDAR filter — only the forward ±60° arc is
+    published on /scan_filtered for SLAM; rear data is discarded to prevent
+    conflicting scan-match when the robot reverses direction.
+  - CHANGED: Obstacle detection uses the filtered 120° arc as well.
+  - CHANGED: Nav2 goals are sent with orientation=robot's current heading
+    so the controller never commands a large in-place rotation on arrival.
+  - CHANGED: Frontier scoring direction weight increased (0.25 → 0.35) to
+    favour frontiers ahead of the robot, reducing the need for sharp turns.
 """
 
 import math
@@ -110,11 +62,10 @@ COSTMAP_LETHAL_THRESH = 70   # range 0-100 (nav2 scale)
 # =============================================================================
 
 class State(Enum):
-    INIT_SPIN       = auto()   # Initial 360 spin to seed SLAM map
     SELECT_FRONTIER = auto()   # Pick best frontier and dispatch Nav2 goal
     NAVIGATING      = auto()   # Waiting for Nav2 to reach goal
-    AVOIDING        = auto()   # Composite avoidance: back-up then spin
-    RECOVERING      = auto()   # Slow spin to expose new frontiers
+    AVOIDING        = auto()   # Composite avoidance: back-up then arc-turn
+    WANDERING       = auto()   # Drive forward with gentle arc (roomba-style)
     COMPLETE        = auto()   # All frontiers exhausted
 
 
@@ -148,18 +99,15 @@ class FrontierExplorer(Node):
         self._declare_params()
         self._load_params()
 
-        # Runtime state
-        self.state: State                           = State.INIT_SPIN
+        # Runtime state — start directly selecting frontiers (no INIT_SPIN)
+        self.state: State                           = State.SELECT_FRONTIER
         self.map_data: Optional[OccupancyGrid]      = None
-        self.costmap_data: Optional[OccupancyGrid]  = None   # P1
+        self.costmap_data: Optional[OccupancyGrid]  = None
         self.latest_scan: Optional[LaserScan]       = None
-        self._enabled: bool                         = True   # P2 pause/resume
+        self._enabled: bool                         = True
 
         # Robot pose (map frame)
         self.rx = self.ry = self.ryaw = 0.0
-
-        # Init-spin timing
-        self._spin_t0: Optional[float] = None
 
         # Navigation bookkeeping
         self._goal_handle              = None
@@ -170,14 +118,16 @@ class FrontierExplorer(Node):
         # Counters
         self.consec_fail:  int = 0
         self.total_fail:   int = 0
-        self.recov_spins:  int = 0
+        self._no_frontier_streak: int = 0
 
         # Avoidance bookkeeping
         self._avoid_t0: Optional[float] = None
-        self._avoid_phase: int          = 0   # 0=back-up, 1=spin
+        self._avoid_phase: int          = 0   # 0=back-up, 1=arc-turn
+        self._avoid_dir: float          = 1.0  # +1 or -1 (random arc direction)
 
-        # Recovery bookkeeping
-        self._recov_t0: Optional[float] = None
+        # Wandering bookkeeping
+        self._wander_t0: Optional[float] = None
+        self._wander_arc_dir: float      = 1.0
 
         # Visited frontier history (bounded deque)
         self._visited: Deque[Tuple[float, float]] = deque(maxlen=24)
@@ -189,10 +139,10 @@ class FrontierExplorer(Node):
         # Failure-direction tracking: list of (bearing_rad, timestamp)
         self._failed_bearings: Deque[Tuple[float, float]] = deque(maxlen=100)
 
-        # Bug 4: ensure _state_complete executes exactly once
+        # Ensure _state_complete executes exactly once
         self._completed: bool = False
 
-        # Bug 3: service readiness flags (updated by 1 Hz probe timer)
+        # Service readiness flags (updated by 1 Hz probe timer)
         self._svc_local_ok:  bool = False
         self._svc_global_ok: bool = False
 
@@ -200,16 +150,16 @@ class FrontierExplorer(Node):
         self._map_cache_header_stamp = None
         self._map_cache_array: Optional[np.ndarray] = None
 
-        # Costmap data cache (Perf 7): same strategy as map cache
+        # Costmap data cache
         self._costmap_cache_header_stamp = None
         self._costmap_cache_array: Optional[np.ndarray] = None
 
-        # Scan data cache (Perf 5): avoid rebuilding numpy arrays every tick
+        # Scan data cache
         self._scan_cache_seq: Optional[int] = None
         self._scan_cache_ranges: Optional[np.ndarray] = None
         self._scan_cache_angles: Optional[np.ndarray] = None
 
-        # RNG for score perturbation (Bug 11): reuse to avoid repeated instantiation
+        # RNG for score perturbation & wander arc direction
         self._rng = np.random.default_rng()
 
         # TF
@@ -227,15 +177,17 @@ class FrontierExplorer(Node):
         self.create_subscription(OccupancyGrid, "/map",
                                  self._map_cb,     tl_qos)
         self.create_subscription(OccupancyGrid, "/global_costmap/costmap",
-                                 self._costmap_cb, tl_qos)   # P1
+                                 self._costmap_cb, tl_qos)
         self.create_subscription(LaserScan, "/scan",
                                  self._scan_cb, 10)
         self.create_subscription(Bool, "/explore/enable",
-                                 self._enable_cb, 10)         # P2
+                                 self._enable_cb, 10)
 
         # Publishers
         self._cmd_vel_pub = self.create_publisher(Twist,       "/cmd_vel",   10)
         self._viz_pub     = self.create_publisher(MarkerArray, "/frontiers", 10)
+        # Filtered scan publisher: only the front 120° arc, used by SLAM
+        self._filtered_scan_pub = self.create_publisher(LaserScan, "/scan_filtered", 10)
 
         # Nav2 action client
         self._nav_ac = ActionClient(self, NavigateToPose, "navigate_to_pose")
@@ -251,15 +203,15 @@ class FrontierExplorer(Node):
         # Timers
         self._ctrl_timer = self.create_timer(0.2,                  self._ctrl_loop)
         self._prog_timer = self.create_timer(self.p_log_interval,  self._log_progress)
-        self._svc_timer  = self.create_timer(1.0,                  self._probe_services)  # Bug 3
+        self._svc_timer  = self.create_timer(1.0,                  self._probe_services)
 
         self.get_logger().info(
             "\n"
-            "╔══════════════════════════════════════════════╗\n"
-            "║  Leo Rover Frontier Explorer  (ROS2 Jazzy)   ║\n"
-            "║  v2.0  -  starting initial 360 spin...       ║\n"
-            "║  Publish False to /explore/enable to pause.  ║\n"
-            "╚══════════════════════════════════════════════╝"
+            "╔══════════════════════════════════════════════════╗\n"
+            "║  Leo Rover Frontier Explorer  (ROS2 Jazzy)       ║\n"
+            "║  v3.0  -  roomba-style, no spins, 120° lidar    ║\n"
+            "║  Publish False to /explore/enable to pause.      ║\n"
+            "╚══════════════════════════════════════════════════╝"
         )
 
     # -------------------------------------------------------------------------
@@ -271,22 +223,25 @@ class FrontierExplorer(Node):
         self.declare_parameter("map_frame",            "map")
         self.declare_parameter("min_frontier_size",    5)
         self.declare_parameter("obstacle_dist",        0.50)
-        self.declare_parameter("obstacle_half_angle",  50.0)    # degrees
         self.declare_parameter("nav_timeout",          35.0)    # s
-        self.declare_parameter("spin_speed",           0.55)    # rad/s
-        self.declare_parameter("spin_duration",        12.5)    # s
         self.declare_parameter("backup_speed",        -0.18)    # m/s
         self.declare_parameter("backup_duration",      1.8)     # s
-        self.declare_parameter("avoid_spin_duration",  2.5)     # s
-        self.declare_parameter("recov_spin_duration",  7.0)     # s
+        self.declare_parameter("avoid_arc_speed",      0.10)    # m/s forward during arc
+        self.declare_parameter("avoid_arc_yaw",        0.60)    # rad/s during arc-turn
+        self.declare_parameter("avoid_arc_duration",   2.5)     # s
         self.declare_parameter("max_consec_fail",      4)
         self.declare_parameter("costmap_clear_every",  3)
         self.declare_parameter("complete_no_frontier", 8)
         self.declare_parameter("log_interval",        12.0)     # s
-        self.declare_parameter("save_map_on_complete", True)    # P2
-        self.declare_parameter("map_save_path",       "/tmp/leo_explored_map")  # P2
+        self.declare_parameter("save_map_on_complete", True)
+        self.declare_parameter("map_save_path",       "/tmp/leo_explored_map")
         self.declare_parameter("blacklist_radius",     2.0)     # m
         self.declare_parameter("blacklist_duration",   300.0)   # s
+        # New v3.0 parameters
+        self.declare_parameter("lidar_fov_deg",       120.0)    # front-facing FOV
+        self.declare_parameter("wander_speed",         0.12)    # m/s
+        self.declare_parameter("wander_arc_yaw",       0.20)    # rad/s gentle arc
+        self.declare_parameter("wander_duration",      6.0)     # s per wander segment
 
     def _load_params(self) -> None:
         g = self.get_parameter
@@ -294,14 +249,12 @@ class FrontierExplorer(Node):
         self.p_map_frame      = g("map_frame").value
         self.p_min_frontier   = g("min_frontier_size").value
         self.p_obs_dist       = g("obstacle_dist").value
-        self.p_obs_half_angle = math.radians(g("obstacle_half_angle").value)
         self.p_nav_timeout    = g("nav_timeout").value
-        self.p_spin_speed     = g("spin_speed").value
-        self.p_spin_duration  = g("spin_duration").value
         self.p_backup_speed   = g("backup_speed").value
         self.p_backup_dur     = g("backup_duration").value
-        self.p_avoid_spin_dur = g("avoid_spin_duration").value
-        self.p_recov_spin_dur = g("recov_spin_duration").value
+        self.p_arc_speed      = g("avoid_arc_speed").value
+        self.p_arc_yaw        = g("avoid_arc_yaw").value
+        self.p_arc_dur        = g("avoid_arc_duration").value
         self.p_max_consec     = g("max_consec_fail").value
         self.p_clear_every    = g("costmap_clear_every").value
         self.p_no_front_done  = g("complete_no_frontier").value
@@ -310,6 +263,11 @@ class FrontierExplorer(Node):
         self.p_map_path       = g("map_save_path").value
         self.p_bl_radius      = g("blacklist_radius").value
         self.p_bl_duration    = g("blacklist_duration").value
+        # v3.0
+        self.p_lidar_half_angle = math.radians(g("lidar_fov_deg").value / 2.0)
+        self.p_wander_speed     = g("wander_speed").value
+        self.p_wander_arc_yaw   = g("wander_arc_yaw").value
+        self.p_wander_dur       = g("wander_duration").value
 
     # -------------------------------------------------------------------------
     #  Callbacks
@@ -317,23 +275,21 @@ class FrontierExplorer(Node):
 
     def _map_cb(self, msg: OccupancyGrid) -> None:
         self.map_data = msg
-        # Invalidate cache when new map arrives
         self._map_cache_header_stamp = None
         self._map_cache_array = None
 
     def _costmap_cb(self, msg: OccupancyGrid) -> None:
         self.costmap_data = msg
-        # Invalidate costmap cache when new data arrives (Perf 7)
         self._costmap_cache_header_stamp = None
         self._costmap_cache_array = None
 
     def _scan_cb(self, msg: LaserScan) -> None:
         self.latest_scan = msg
-        # Invalidate scan cache when new data arrives (Perf 5)
         self._scan_cache_seq = None
+        # Publish filtered (front-arc only) scan for SLAM
+        self._publish_filtered_scan(msg)
 
     def _enable_cb(self, msg: Bool) -> None:
-        """P2: publish std_msgs/Bool False to /explore/enable to pause."""
         was = self._enabled
         self._enabled = msg.data
         if not was and msg.data:
@@ -345,30 +301,66 @@ class FrontierExplorer(Node):
                 self._cancel_nav()
 
     # -------------------------------------------------------------------------
-    #  Timing helper  (Bug 5: use ROS clock, not time.monotonic)
+    #  120° front-facing LiDAR filter
+    # -------------------------------------------------------------------------
+
+    def _publish_filtered_scan(self, scan: LaserScan) -> None:
+        """
+        Publish a copy of the scan with rays outside the front ±60° arc
+        replaced by inf.  SLAM Toolbox subscribes to /scan_filtered instead
+        of /scan, so it only sees the forward view.  This prevents rear
+        laser data from creating conflicting scan matches when the robot
+        turns around, which is the root cause of the ghost-wall phenomenon.
+        """
+        n = len(scan.ranges)
+        if n == 0:
+            return
+
+        # Build angle array
+        angles = (
+            np.arange(n, dtype=np.float32) * scan.angle_increment
+            + scan.angle_min
+        )
+
+        # Mask: keep only front arc
+        keep = np.abs(angles) <= self.p_lidar_half_angle
+
+        # Build filtered ranges
+        ranges = np.array(scan.ranges, dtype=np.float32)
+        filtered = np.where(keep, ranges, float("inf"))
+
+        # Publish
+        out = LaserScan()
+        out.header = scan.header
+        out.angle_min = scan.angle_min
+        out.angle_max = scan.angle_max
+        out.angle_increment = scan.angle_increment
+        out.time_increment = scan.time_increment
+        out.scan_time = scan.scan_time
+        out.range_min = scan.range_min
+        out.range_max = scan.range_max
+        out.ranges = filtered.tolist()
+        if scan.intensities:
+            intensities = np.array(scan.intensities, dtype=np.float32)
+            out.intensities = np.where(keep, intensities, 0.0).tolist()
+        self._filtered_scan_pub.publish(out)
+
+    # -------------------------------------------------------------------------
+    #  Timing helper (use ROS clock for sim_time compatibility)
     # -------------------------------------------------------------------------
 
     def _now_sec(self) -> float:
-        """Seconds from ROS clock. Works with use_sim_time:=true."""
         return self.get_clock().now().nanoseconds * 1e-9
 
     def _get_map_array(self) -> Optional[np.ndarray]:
-        """
-        Return cached numpy array of map data, converting only when map changes.
-        Avoids O(w*h) array conversion on every call to _detect_frontiers
-        and _map_stats when the map hasn't been updated.
-        """
         if self.map_data is None:
             return None
-
         stamp = self.map_data.header.stamp
         if (
             self._map_cache_array is not None
             and self._map_cache_header_stamp == stamp
         ):
             return self._map_cache_array
-
-        # Map changed - rebuild cache
         w = self.map_data.info.width
         h = self.map_data.info.height
         self._map_cache_array = np.array(
@@ -378,20 +370,14 @@ class FrontierExplorer(Node):
         return self._map_cache_array
 
     def _get_costmap_array(self) -> Optional[np.ndarray]:
-        """
-        Perf 7: Return cached numpy array of costmap data.
-        Same caching strategy as _get_map_array().
-        """
         if self.costmap_data is None:
             return None
-
         stamp = self.costmap_data.header.stamp
         if (
             self._costmap_cache_array is not None
             and self._costmap_cache_header_stamp == stamp
         ):
             return self._costmap_cache_array
-
         w = self.costmap_data.info.width
         h = self.costmap_data.info.height
         self._costmap_cache_array = np.array(
@@ -401,7 +387,7 @@ class FrontierExplorer(Node):
         return self._costmap_cache_array
 
     # -------------------------------------------------------------------------
-    #  Service availability probe  (Bug 3: 1 Hz, non-blocking)
+    #  Service availability probe (1 Hz, non-blocking)
     # -------------------------------------------------------------------------
 
     def _probe_services(self) -> None:
@@ -428,17 +414,15 @@ class FrontierExplorer(Node):
         except (LookupException, ConnectivityException, ExtrapolationException):
             return None
 
-    def _obstacle_in_sector(self) -> Tuple[bool, float]:
+    def _obstacle_in_front(self) -> Tuple[bool, float]:
         """
-        Perf 5: Numpy-vectorised forward obstacle check with cached arrays.
-        Caches the ranges/angles numpy conversion to avoid O(n) allocation
-        on every 5 Hz control-loop tick when scan data hasn't changed.
+        Check for obstacles in the front 120° arc only.
+        Uses cached numpy arrays for performance.
         """
         scan = self.latest_scan
         if scan is None:
             return False, float("inf")
 
-        # Cache scan numpy arrays, keyed by header stamp
         scan_stamp = scan.header.stamp
         if self._scan_cache_seq != scan_stamp:
             self._scan_cache_ranges = np.array(scan.ranges, dtype=np.float32)
@@ -454,7 +438,7 @@ class FrontierExplorer(Node):
         valid = (
             np.isfinite(ranges)
             & (ranges > 0.01)
-            & (np.abs(angles) <= self.p_obs_half_angle)
+            & (np.abs(angles) <= self.p_lidar_half_angle)
         )
         if not np.any(valid):
             return False, float("inf")
@@ -463,56 +447,27 @@ class FrontierExplorer(Node):
 
     def _stop(self)  -> None: self._cmd_vel_pub.publish(Twist())
 
-    def _spin(self, speed: Optional[float] = None) -> None:
-        t = Twist()
-        t.angular.z = speed if speed is not None else self.p_spin_speed
-        self._cmd_vel_pub.publish(t)
-
     def _drive(self, vx: float, wz: float = 0.0) -> None:
         t = Twist()
         t.linear.x  = vx
         t.angular.z = wz
         self._cmd_vel_pub.publish(t)
 
-    def _drive_forward(self, speed: float = 0.15, duration: float = 3.0) -> None:
-        """Drive forward for `duration` seconds, then return to SELECT_FRONTIER."""
-        if not hasattr(self, '_fwd_t0') or self._fwd_t0 is None:
-            self._fwd_t0 = self._now_sec()
-            self.get_logger().info(f"Driving forward at {speed} m/s for {duration}s")
-        elapsed = self._now_sec() - self._fwd_t0
-        if elapsed < duration:
-            self._drive(speed)
-        else:
-            self._stop()
-            self._fwd_t0 = None
-            self.state = State.SELECT_FRONTIER
-
     # -------------------------------------------------------------------------
-    #  Map statistics  (Bug 1: single source of truth for progress data)
+    #  Map statistics
     # -------------------------------------------------------------------------
 
     def _map_stats(self) -> Tuple[int, int, int, float]:
-        """
-        Returns (free_cells, occupied_cells, unknown_cells, explored_pct).
-        Uses int8 dtype: unknown=-1, free=0, occupied=1..100.
-        Both _log_progress() and _explored_pct() delegate here (Bug 1 fix).
-        Uses cached array to avoid redundant numpy conversions.
-
-        Perf 6: Uses np.bincount for single-pass counting instead of three
-        separate np.sum operations.
-        """
         raw = self._get_map_array()
         if raw is None:
             return 0, 0, 0, 0.0
         d    = raw.ravel()
         total = d.size
-        # Shift values: int8 -1→0, 0→1, 1→2, ..., 100→101
-        # so all values are non-negative for bincount
         shifted = d.astype(np.int16) + 1
         counts = np.bincount(shifted, minlength=102)
-        unk  = int(counts[0])          # original -1
-        free = int(counts[1])          # original  0
-        occ  = int(counts[2:102].sum())  # original 1..100
+        unk  = int(counts[0])
+        free = int(counts[1])
+        occ  = int(counts[2:102].sum())
         pct  = (free + occ) / total * 100.0
         return free, occ, unk, pct
 
@@ -524,15 +479,6 @@ class FrontierExplorer(Node):
     # -------------------------------------------------------------------------
 
     def _detect_frontiers(self) -> List[Frontier]:
-        """
-        Detect free cells adjacent to unknown cells, cluster them, and apply
-        the costmap inflation filter (P1).
-
-        Bug 2 fix: dilation uses np.pad instead of np.roll. np.roll wraps the
-        last row/column around to the opposite edge, creating phantom frontier
-        detections at map borders even after manual edge-clearing. np.pad with
-        constant_values=False (zero) avoids this entirely.
-        """
         raw = self._get_map_array()
         if raw is None:
             return []
@@ -545,13 +491,13 @@ class FrontierExplorer(Node):
         free    = raw == 0
         unknown = raw == -1
 
-        # Bug 2 fix: pad-based 4-connected dilation
+        # Pad-based 4-connected dilation (no edge-wrap artefacts)
         padded = np.pad(unknown, 1, mode="constant", constant_values=False)
         unk_d  = (
-            padded[:-2, 1:-1]    # row above
-            | padded[2:,  1:-1]  # row below
-            | padded[1:-1, :-2]  # col left
-            | padded[1:-1, 2:]   # col right
+            padded[:-2, 1:-1]
+            | padded[2:,  1:-1]
+            | padded[1:-1, :-2]
+            | padded[1:-1, 2:]
         )
 
         frontier_mask = free & unk_d
@@ -562,7 +508,6 @@ class FrontierExplorer(Node):
         clusters: dict = {}
 
         ys, xs = np.where(frontier_mask)
-        # Iterate directly over numpy arrays - avoid Python list conversion overhead
         for i in range(len(ys)):
             sy, sx = int(ys[i]), int(xs[i])
             if labeled[sy, sx] != 0:
@@ -575,7 +520,7 @@ class FrontierExplorer(Node):
             labeled[sy, sx] = cluster_id
             while q:
                 cy, cx = q.popleft()
-                cells.append((cx, cy))          # (col, row)
+                cells.append((cx, cy))
                 for dy in (-1, 0, 1):
                     for dx in (-1, 0, 1):
                         ny, nx = cy + dy, cx + dx
@@ -594,7 +539,6 @@ class FrontierExplorer(Node):
             n_cells = len(cells)
             if n_cells < self.p_min_frontier:
                 continue
-            # Vectorized centroid calculation using numpy
             cells_arr = np.array(cells, dtype=np.float32)
             mean_col = cells_arr[:, 0].mean()
             mean_row = cells_arr[:, 1].mean()
@@ -602,24 +546,19 @@ class FrontierExplorer(Node):
             wy = mean_row * res + oy
             candidates.append(Frontier(wx, wy, n_cells))
 
-        # Perf 8: Batch costmap inflation filter
+        # Batch costmap inflation filter
         frontiers = self._filter_frontiers_by_costmap(candidates)
         return frontiers
 
     def _filter_frontiers_by_costmap(
         self, frontiers: List[Frontier]
     ) -> List[Frontier]:
-        """
-        Perf 8: Batch-check all frontier centroids against the costmap
-        inflation zone in one vectorized numpy operation, replacing the
-        per-frontier _frontier_in_inflation() Python loop.
-        """
         if not frontiers:
             return []
 
         cm = self.costmap_data
         if cm is None:
-            return frontiers  # costmap not yet available: allow all through
+            return frontiers
 
         cm_arr = self._get_costmap_array()
         if cm_arr is None:
@@ -630,28 +569,19 @@ class FrontierExplorer(Node):
         oy  = cm.info.origin.position.y
         h, w = cm_arr.shape
 
-        # Build coordinate arrays for all frontiers at once
         wx = np.array([f.cx for f in frontiers], dtype=np.float32)
         wy = np.array([f.cy for f in frontiers], dtype=np.float32)
 
         cols = ((wx - ox) / res).astype(np.int32)
         rows = ((wy - oy) / res).astype(np.int32)
 
-        # Mask: inside costmap bounds
         in_bounds = (cols >= 0) & (cols < w) & (rows >= 0) & (rows < h)
-
-        # For out-of-bounds frontiers, allow through (not in inflation)
         in_inflation = np.zeros(len(frontiers), dtype=bool)
 
         if np.any(in_bounds):
             ib_rows = rows[in_bounds]
             ib_cols = cols[in_bounds]
             costs = cm_arr[ib_rows, ib_cols].astype(np.int16)
-            # The costmap array uses int8 dtype, so ROS values 128-255
-            # wrap to negative in int8. Cast to int16 to recover the
-            # original unsigned semantics for threshold comparison.
-            # nav2 costmap: 0=free, 1-252=inflated, 253=inscribed,
-            # 254=lethal, 255=unknown.  We filter >= COSTMAP_LETHAL_THRESH.
             unsigned_costs = costs + np.int16(256) * (costs < 0)
             in_inflation[in_bounds] = (
                 (unsigned_costs >= COSTMAP_LETHAL_THRESH)
@@ -670,23 +600,18 @@ class FrontierExplorer(Node):
         rx: float, ry: float, ryaw: float,
     ) -> List[Frontier]:
         """
-        score = 0.35 * info_gain
-              + 0.30 * dist_score
-              + 0.25 * dir_score
+        score = 0.30 * info_gain
+              + 0.25 * dist_score
+              + 0.35 * dir_score       ← increased from 0.25 to favour
+                                          frontiers in front of the robot
               - visit_penalty
               - fail_dir_penalty
 
-        Frontiers closer than 0.5m are FILTERED OUT entirely — sending
-        a goal that close causes the controller to instantly report
-        'Reached the goal' without actually moving.
+        Frontiers closer than 0.5 m are filtered out.
         """
         if not frontiers:
             return []
 
-        # Perf 9: Removed dead visited-list trimming code. The _visited
-        # deque has maxlen=24, so len() > 50 was unreachable.
-
-        # Extract frontier coordinates as numpy arrays for vectorized computation
         n = len(frontiers)
         fx = np.array([f.cx for f in frontiers], dtype=np.float32)
         fy = np.array([f.cy for f in frontiers], dtype=np.float32)
@@ -695,13 +620,11 @@ class FrontierExplorer(Node):
         # Vectorized distance calculation
         dists = np.hypot(fx - rx, fy - ry)
 
-        # Filter out frontiers too close (< 0.5m)
+        # Filter out frontiers too close (<0.5 m)
         valid_mask = dists >= 0.5
 
         # Filter out frontiers near blacklisted (unreachable) goals
-        # Bug 7: adaptive blacklist radius scales with consecutive failures
         now = self._now_sec()
-        # Prune expired blacklist entries
         while self._blacklist and (now - self._blacklist[0][2]) > self.p_bl_duration:
             self._blacklist.popleft()
         adaptive_bl_radius = self.p_bl_radius * (1.0 + 0.3 * self.consec_fail)
@@ -715,17 +638,17 @@ class FrontierExplorer(Node):
             )
             valid_mask &= ~np.any(dists_to_bl < adaptive_bl_radius, axis=1)
 
-        # Vectorized information gain (normalised cluster size)
+        # Info gain (normalised cluster size)
         info_scores = np.minimum(1.0, sizes / 60.0)
 
-        # Vectorized distance score: prefer 1.0-4.0 m range
+        # Distance score: prefer 1.0-4.0 m range
         dist_scores = np.where(
             dists <= 4.0,
             1.0 - np.abs(dists - 2.0) / 4.0,
             np.maximum(0.0, 1.0 - (dists - 4.0) / 6.0)
         )
 
-        # Vectorized direction score: prefer frontiers ahead of robot
+        # Direction score: prefer frontiers ahead of robot (v3.0: weight ↑)
         angles_to = np.arctan2(fy - ry, fx - rx)
         angle_diffs = np.abs(np.arctan2(
             np.sin(angles_to - ryaw),
@@ -733,22 +656,17 @@ class FrontierExplorer(Node):
         ))
         dir_scores = np.maximum(0.0, 1.0 - angle_diffs / np.pi)
 
-        # Vectorized revisit penalty computation
-        # Bug 10: stronger penalty 0.55 within 1.0 m
+        # Revisit penalty
         visit_pens = np.zeros(n, dtype=np.float32)
         if self._visited:
             visited_arr = np.array(list(self._visited), dtype=np.float32)
-            # Compute distances from each frontier to all visited points
-            # Shape: (n_frontiers, n_visited)
             dists_to_visited = np.sqrt(
                 (fx[:, np.newaxis] - visited_arr[:, 0]) ** 2 +
                 (fy[:, np.newaxis] - visited_arr[:, 1]) ** 2
             )
-            # Apply penalty if any visited point is within 1.0m
             visit_pens = np.where(np.any(dists_to_visited < 1.0, axis=1), 0.55, 0.0)
 
-        # Bug 8: failure-direction penalty
-        # Prune expired failure bearings (same duration as blacklist)
+        # Failure-direction penalty
         while (self._failed_bearings
                and (now - self._failed_bearings[0][1]) > self.p_bl_duration):
             self._failed_bearings.popleft()
@@ -757,28 +675,25 @@ class FrontierExplorer(Node):
             fb_arr = np.array(
                 [b for b, _ in self._failed_bearings], dtype=np.float32
             )
-            # Angular difference between each frontier bearing and each
-            # failed bearing — shape (n_frontiers, n_failed_bearings)
             bearing_diffs = np.abs(np.arctan2(
                 np.sin(angles_to[:, np.newaxis] - fb_arr[np.newaxis, :]),
                 np.cos(angles_to[:, np.newaxis] - fb_arr[np.newaxis, :]),
             ))
-            # Penalise if any failed bearing is within 30°
             fail_dir_pens = np.where(
                 np.any(bearing_diffs < math.radians(30.0), axis=1),
                 0.35, 0.0
             )
 
-        # Bug 9: rebalanced scoring weights
+        # v3.0: rebalanced scoring weights — direction heavily favoured
         scores = (
-            0.35 * info_scores
-            + 0.30 * dist_scores
-            + 0.25 * dir_scores
+            0.30 * info_scores
+            + 0.25 * dist_scores
+            + 0.35 * dir_scores
             - visit_pens
             - fail_dir_pens
         )
 
-        # Bug 11: random perturbation after 2+ consecutive failures
+        # Random perturbation after 2+ consecutive failures
         if self.consec_fail >= 2:
             scores += self._rng.uniform(-0.15, 0.15, size=n).astype(np.float32)
 
@@ -806,11 +721,18 @@ class FrontierExplorer(Node):
         goal.pose.header.stamp       = self.get_clock().now().to_msg()
         goal.pose.pose.position.x    = fx
         goal.pose.pose.position.y    = fy
-        goal.pose.pose.orientation.w = 1.0
+
+        # v3.0: Set goal orientation to face TOWARD the goal from current
+        # position, so Nav2 won't command a large rotation on arrival.
+        dx = fx - self.rx
+        dy = fy - self.ry
+        goal_yaw = math.atan2(dy, dx)
+        goal.pose.pose.orientation.z = math.sin(goal_yaw / 2.0)
+        goal.pose.pose.orientation.w = math.cos(goal_yaw / 2.0)
 
         self._nav_done = False
         self._nav_ok   = False
-        self._nav_t0   = self._now_sec()   # Bug 5: ROS clock
+        self._nav_t0   = self._now_sec()
         self._current_goal = (fx, fy)
 
         fut = self._nav_ac.send_goal_async(goal)
@@ -845,10 +767,6 @@ class FrontierExplorer(Node):
         self._nav_done = True
 
     def _clear_costmaps(self) -> None:
-        """
-        Bug 3 fix: never blocks the control loop.
-        _probe_services() updates _svc_*_ok flags at 1 Hz without blocking.
-        """
         self.get_logger().info("Clearing costmaps...")
         req = ClearEntireCostmap.Request()
         if self._svc_local_ok:
@@ -861,17 +779,11 @@ class FrontierExplorer(Node):
             self.get_logger().warn("Global costmap clear service not ready")
 
     def _blacklist_current_goal(self) -> None:
-        """Add the current navigation goal to the blacklist so that nearby
-        frontiers are excluded from future selection until the entry expires.
-        Also record the bearing from the robot to the failed goal so that
-        frontiers in the same direction receive a scoring penalty (Bug 8)."""
         if self._current_goal is None:
             return
         gx, gy = self._current_goal
         now = self._now_sec()
         self._blacklist.append((gx, gy, now))
-        # Bug 8: record failure bearing for direction penalty
-        # Use latest TF pose for accurate bearing calculation
         pose = self._robot_in_map()
         if pose is not None:
             cur_rx, cur_ry, _ = pose
@@ -884,11 +796,10 @@ class FrontierExplorer(Node):
         )
 
     # -------------------------------------------------------------------------
-    #  Map save  (P2)
+    #  Map save
     # -------------------------------------------------------------------------
 
     def _save_map(self) -> None:
-        """P2: save the final map via nav2_map_server map_saver_cli."""
         if not self.p_save_map:
             return
         path = self.p_map_path
@@ -943,7 +854,7 @@ class FrontierExplorer(Node):
         self._viz_pub.publish(ma)
 
     # -------------------------------------------------------------------------
-    #  Logging  (Bug 1: delegates to _map_stats)
+    #  Logging
     # -------------------------------------------------------------------------
 
     def _log_progress(self) -> None:
@@ -966,34 +877,16 @@ class FrontierExplorer(Node):
 
     def _ctrl_loop(self) -> None:
         if not self._enabled:
-            return    # P2: paused
+            return
 
-        now = self._now_sec()   # Bug 5: ROS clock
+        now = self._now_sec()
         {
-            State.INIT_SPIN:       self._state_init_spin,
             State.SELECT_FRONTIER: self._state_select,
             State.NAVIGATING:      self._state_navigating,
             State.AVOIDING:        self._state_avoiding,
-            State.RECOVERING:      self._state_recovering,
+            State.WANDERING:       self._state_wandering,
             State.COMPLETE:        self._state_complete,
         }[self.state](now)
-
-    # -------------------------------------------------------------------------
-    #  State: INIT_SPIN
-    # -------------------------------------------------------------------------
-
-    def _state_init_spin(self, now: float) -> None:
-        if self._spin_t0 is None:
-            self._spin_t0 = now
-            self.get_logger().info("Initial 360 spin started...")
-
-        if now - self._spin_t0 < self.p_spin_duration:
-            self._spin()
-        else:
-            self._stop()
-            self._spin_t0 = None
-            self.get_logger().info("Initial spin done - starting exploration")
-            self.state = State.SELECT_FRONTIER
 
     # -------------------------------------------------------------------------
     #  State: SELECT_FRONTIER
@@ -1001,10 +894,11 @@ class FrontierExplorer(Node):
 
     def _state_select(self, now: float) -> None:
         if self.map_data is None:
-            self.get_logger().warn("Waiting for /map...")
+            # No map yet — wander forward to generate initial scan data
+            self._drive(self.p_wander_speed, 0.0)
             return
 
-        # Periodic costmap clear on consecutive failures (non-blocking, Bug 3)
+        # Periodic costmap clear on consecutive failures (non-blocking)
         if self.consec_fail > 0 and self.consec_fail % self.p_clear_every == 0:
             self._clear_costmaps()
 
@@ -1018,23 +912,24 @@ class FrontierExplorer(Node):
         raw_frontiers = self._detect_frontiers()
 
         if not raw_frontiers:
-            self.recov_spins += 1
+            self._no_frontier_streak += 1
             self.get_logger().warn(
-                f"No frontiers found (streak={self.recov_spins})"
+                f"No frontiers found (streak={self._no_frontier_streak})"
             )
-            if self.recov_spins >= self.p_no_front_done:
+            if self._no_frontier_streak >= self.p_no_front_done:
                 self.get_logger().info("No frontiers left - exploration complete!")
                 self.state = State.COMPLETE
             else:
-                self.state = State.RECOVERING
+                # Wander forward instead of spinning
+                self.state = State.WANDERING
             return
 
-        self.recov_spins = 0
+        self._no_frontier_streak = 0
 
         if self.consec_fail >= self.p_max_consec:
-            self.get_logger().warn("Too many consecutive failures - recovery spin")
+            self.get_logger().warn("Too many consecutive failures - wandering")
             self.consec_fail = 0
-            self.state = State.RECOVERING
+            self.state = State.WANDERING
             return
 
         scored = self._score_frontiers(raw_frontiers, rx, ry, ryaw)
@@ -1043,9 +938,9 @@ class FrontierExplorer(Node):
         # All frontiers too close (filtered out by _score_frontiers)
         if not scored:
             self.get_logger().warn(
-                "All frontiers too close — driving forward to explore"
+                "All frontiers too close — wandering forward"
             )
-            self._drive_forward(speed=0.15, duration=3.0)
+            self.state = State.WANDERING
             return
 
         best = scored[0]
@@ -1066,7 +961,7 @@ class FrontierExplorer(Node):
 
     def _state_navigating(self, now: float) -> None:
         # Emergency obstacle avoidance (threshold = 65% of configured distance)
-        obs, dist = self._obstacle_in_sector()
+        obs, dist = self._obstacle_in_front()
         if obs and dist < self.p_obs_dist * 0.65:
             self.get_logger().warn(
                 f"Obstacle at {dist:.2f} m - emergency avoidance"
@@ -1074,6 +969,8 @@ class FrontierExplorer(Node):
             self._cancel_nav()
             self._avoid_t0    = now
             self._avoid_phase = 0
+            # Random arc direction for avoidance
+            self._avoid_dir = 1.0 if self._rng.random() > 0.5 else -1.0
             self.state = State.AVOIDING
             return
 
@@ -1090,7 +987,7 @@ class FrontierExplorer(Node):
             self.state = State.SELECT_FRONTIER
             return
 
-        # Timeout guard (uses ROS clock via _nav_t0 set in _send_goal)
+        # Timeout guard
         if (
             self._nav_t0 is not None
             and (now - self._nav_t0) > self.p_nav_timeout
@@ -1104,7 +1001,7 @@ class FrontierExplorer(Node):
             self.state = State.SELECT_FRONTIER
 
     # -------------------------------------------------------------------------
-    #  State: AVOIDING
+    #  State: AVOIDING  (v3.0: backup + arc-turn, no pure spin)
     # -------------------------------------------------------------------------
 
     def _state_avoiding(self, now: float) -> None:
@@ -1114,15 +1011,14 @@ class FrontierExplorer(Node):
             if elapsed < self.p_backup_dur:
                 self._drive(self.p_backup_speed)
             else:
-                # Transition to spin; reset t0 BEFORE next tick (Bug 6 from prev)
+                # Transition to arc-turn
                 self._avoid_phase = 1
                 self._avoid_t0    = now
-                self._spin(self.p_spin_speed * 1.4)   # start immediately
         else:
-            # Phase 1: spin to clear obstacle; elapsed measured from new t0
+            # Phase 1: arc-turn (drive forward with angular velocity)
             elapsed = now - (self._avoid_t0 or now)
-            if elapsed < self.p_avoid_spin_dur:
-                self._spin(self.p_spin_speed * 1.4)
+            if elapsed < self.p_arc_dur:
+                self._drive(self.p_arc_speed, self._avoid_dir * self.p_arc_yaw)
             else:
                 self._stop()
                 self.get_logger().info("Avoidance manoeuvre complete")
@@ -1131,29 +1027,46 @@ class FrontierExplorer(Node):
                 self.state = State.SELECT_FRONTIER
 
     # -------------------------------------------------------------------------
-    #  State: RECOVERING
+    #  State: WANDERING  (v3.0: roomba-style forward drive with gentle arc)
     # -------------------------------------------------------------------------
 
-    def _state_recovering(self, now: float) -> None:
-        if self._recov_t0 is None:
-            self._recov_t0 = now
-            self.get_logger().info("Recovery spin...")
+    def _state_wandering(self, now: float) -> None:
+        if self._wander_t0 is None:
+            self._wander_t0 = now
+            # Random gentle arc direction
+            self._wander_arc_dir = 1.0 if self._rng.random() > 0.5 else -1.0
+            self.get_logger().info("Wandering forward (roomba-style)...")
 
-        if now - self._recov_t0 < self.p_recov_spin_dur:
-            self._spin()
+        # Check for obstacle
+        obs, dist = self._obstacle_in_front()
+        if obs and dist < self.p_obs_dist:
+            self.get_logger().info(
+                f"Obstacle during wander at {dist:.2f} m - avoiding"
+            )
+            self._wander_t0 = None
+            self._avoid_t0    = now
+            self._avoid_phase = 0
+            self._avoid_dir = 1.0 if self._rng.random() > 0.5 else -1.0
+            self.state = State.AVOIDING
+            return
+
+        elapsed = now - self._wander_t0
+        if elapsed < self.p_wander_dur:
+            self._drive(self.p_wander_speed,
+                        self._wander_arc_dir * self.p_wander_arc_yaw)
         else:
             self._stop()
-            self._recov_t0 = None
-            self.get_logger().info("Recovery spin done")
+            self._wander_t0 = None
+            self.get_logger().info("Wander segment done — re-selecting frontier")
             self.state = State.SELECT_FRONTIER
 
     # -------------------------------------------------------------------------
-    #  State: COMPLETE  (Bug 4: exactly-once guard)
+    #  State: COMPLETE (exactly-once guard)
     # -------------------------------------------------------------------------
 
     def _state_complete(self, now: float) -> None:
         if self._completed:
-            return              # already handled - do nothing
+            return
         self._completed = True
 
         self._stop()
@@ -1164,12 +1077,11 @@ class FrontierExplorer(Node):
             f"  Total failures : {self.total_fail}"
         )
 
-        # Cancel all timers cleanly
         self._ctrl_timer.cancel()
         self._prog_timer.cancel()
         self._svc_timer.cancel()
 
-        self._save_map()    # P2
+        self._save_map()
 
 
 # =============================================================================
