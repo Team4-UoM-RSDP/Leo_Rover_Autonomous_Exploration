@@ -591,16 +591,22 @@ class FrontierExplorer(Node):
         self._cmd_vel_pub.publish(t)
 
     def _drive_forward(self, speed: float = 0.15, duration: float = 3.0) -> None:
-        """Drive forward for `duration` seconds, then return to SELECT_FRONTIER."""
+        """Drive forward for `duration` seconds, then return to SELECT_FRONTIER.
+        Bug 21: added obstacle safety check — stops immediately if wall ahead.
+        """
         if not hasattr(self, '_fwd_t0') or self._fwd_t0 is None:
             self._fwd_t0 = self._now_sec()
             self.get_logger().info(f"Driving forward at {speed} m/s for {duration}s")
         elapsed = self._now_sec() - self._fwd_t0
-        if elapsed < duration:
+        # Bug 21: check for obstacle before driving
+        obs, dist = self._obstacle_in_sector()
+        if elapsed < duration and not (obs and dist < self.p_obs_dist):
             self._drive(speed)
         else:
             self._stop()
             self._fwd_t0 = None
+            if obs:
+                self.get_logger().info("Forward drive stopped — obstacle ahead")
             self.state = State.SELECT_FRONTIER
 
     # -------------------------------------------------------------------------
@@ -1162,10 +1168,18 @@ class FrontierExplorer(Node):
 
         # All frontiers too close (filtered out by _score_frontiers)
         if not scored:
-            self.get_logger().warn(
-                "All frontiers too close — driving forward to explore"
-            )
-            self._drive_forward(speed=0.15, duration=3.0)
+            # Bug 21: DON'T drive blindly forward — check for obstacle first
+            obs, dist = self._obstacle_in_sector()
+            if obs and dist < self.p_obs_dist:
+                self.get_logger().warn(
+                    "All frontiers too close & obstacle ahead — entering recovery"
+                )
+                self.state = State.RECOVERING
+            else:
+                self.get_logger().warn(
+                    "All frontiers too close — safe short forward drive"
+                )
+                self._drive_forward(speed=0.10, duration=2.0)
             return
 
         best = scored[0]
