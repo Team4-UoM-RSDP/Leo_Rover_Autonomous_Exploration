@@ -1007,9 +1007,9 @@ class FrontierExplorer(Node):
     # -------------------------------------------------------------------------
 
     def _state_navigating(self, now: float) -> None:
-        # Emergency obstacle avoidance (threshold = 65% of configured distance)
+        # Emergency obstacle avoidance (threshold = 85% of configured distance)
         obs, dist = self._obstacle_in_sector()
-        if obs and dist < self.p_obs_dist * 0.65:
+        if obs and dist < self.p_obs_dist * 0.85:
             self.get_logger().warn(
                 f"Obstacle at {dist:.2f} m — emergency avoidance (no spin)"
             )

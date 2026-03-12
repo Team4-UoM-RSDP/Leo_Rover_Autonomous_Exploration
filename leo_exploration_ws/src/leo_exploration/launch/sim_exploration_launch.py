@@ -312,13 +312,13 @@ def generate_launch_description():
                     "robot_frame":           "base_link",
                     "map_frame":             "map",
                     "min_frontier_size":     5,
-                    "obstacle_dist":         0.45,
+                    "obstacle_dist":         0.65,
                     "scan_half_angle":       90.0,       # 180° front-only lidar
                     "nav_timeout":           45.0,
                     "init_forward_speed":    0.15,       # no spin, drive forward
                     "init_forward_duration": 3.0,
                     "backup_speed":         -0.18,
-                    "backup_duration":       1.8,
+                    "backup_duration":       3.0,
                     "avoid_curve_speed":     0.10,       # gentle curve, no spin
                     "avoid_curve_angular":   0.5,
                     "avoid_curve_duration":  2.0,
