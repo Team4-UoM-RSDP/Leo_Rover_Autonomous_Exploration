@@ -51,6 +51,13 @@ map ──(SLAM)──▶ odom ──(DiffDrive/firmware)──▶ base_footprin
 - **Anti Ghost-Wall**: On obstacle encounter, the system backs up and curves *without* regenerating a new arbitrary frontier. Multi-factor frontier scoring heavily penalizes recently visited spots to prevent endless returning/oscillation.
 
 ---
+## once
+
+```bash
+git clone https://github.com/Team4-UoM-RSDP/LeoRoverAutonomousExploration.git
+chmod +x run_sim.sh
+./run_sim.sh
+```
 
 ## Quick Start (Simulation)
 
