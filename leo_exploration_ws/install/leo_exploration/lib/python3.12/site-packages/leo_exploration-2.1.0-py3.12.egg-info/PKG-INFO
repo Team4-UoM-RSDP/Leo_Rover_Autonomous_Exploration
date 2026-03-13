@@ -1,0 +1,7 @@
+Metadata-Version: 2.1
+Name: leo-exploration
+Version: 2.1.0
+Summary: Frontier-based autonomous exploration for Leo Rover (ROS2 Jazzy) v2.1
+Maintainer: You
+Maintainer-email: you@example.com
+License: MIT

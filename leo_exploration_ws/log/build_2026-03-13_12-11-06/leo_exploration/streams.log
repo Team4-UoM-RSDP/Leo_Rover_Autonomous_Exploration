@@ -1,0 +1,27 @@
+[0.453s] Invoking command in '/home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/src/leo_exploration': DEBUGINFOD_URLS=https://debuginfod.ubuntu.com PYTHONPATH=/home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/build/leo_exploration/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/install/leo_exploration/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/leo_exploration build --build-base /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/build/leo_exploration/build install --record /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/build/leo_exploration/install.log --single-version-externally-managed install_data
+[0.607s] running egg_info
+[0.617s] writing ../../build/leo_exploration/leo_exploration.egg-info/PKG-INFO
+[0.617s] writing dependency_links to ../../build/leo_exploration/leo_exploration.egg-info/dependency_links.txt
+[0.617s] writing entry points to ../../build/leo_exploration/leo_exploration.egg-info/entry_points.txt
+[0.617s] writing requirements to ../../build/leo_exploration/leo_exploration.egg-info/requires.txt
+[0.617s] writing top-level names to ../../build/leo_exploration/leo_exploration.egg-info/top_level.txt
+[0.638s] reading manifest file '../../build/leo_exploration/leo_exploration.egg-info/SOURCES.txt'
+[0.638s] writing manifest file '../../build/leo_exploration/leo_exploration.egg-info/SOURCES.txt'
+[0.639s] running build
+[0.639s] running build_py
+[0.639s] copying leo_exploration/frontier_explorer.py -> /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/build/leo_exploration/build/lib/leo_exploration
+[0.639s] running install
+[0.643s] running install_lib
+[0.653s] copying /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/build/leo_exploration/build/lib/leo_exploration/frontier_explorer.py -> /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/install/leo_exploration/lib/python3.12/site-packages/leo_exploration
+[0.654s] byte-compiling /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/install/leo_exploration/lib/python3.12/site-packages/leo_exploration/frontier_explorer.py to frontier_explorer.cpython-312.pyc
+[0.659s] running install_data
+[0.659s] copying launch/sim_exploration_launch.py -> /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/install/leo_exploration/share/leo_exploration/launch
+[0.659s] copying launch/exploration_launch.py -> /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/install/leo_exploration/share/leo_exploration/launch
+[0.659s] copying config/nav2_params.yaml -> /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/install/leo_exploration/share/leo_exploration/config
+[0.660s] running install_egg_info
+[0.671s] removing '/home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/install/leo_exploration/lib/python3.12/site-packages/leo_exploration-2.1.0-py3.12.egg-info' (and everything under it)
+[0.671s] Copying ../../build/leo_exploration/leo_exploration.egg-info to /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/install/leo_exploration/lib/python3.12/site-packages/leo_exploration-2.1.0-py3.12.egg-info
+[0.671s] running install_scripts
+[0.743s] Installing frontier_explorer script to /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/install/leo_exploration/lib/leo_exploration
+[0.743s] writing list of installed files to '/home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/build/leo_exploration/install.log'
+[0.760s] Invoked command in '/home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/src/leo_exploration' returned '0': DEBUGINFOD_URLS=https://debuginfod.ubuntu.com PYTHONPATH=/home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/build/leo_exploration/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/install/leo_exploration/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/leo_exploration build --build-base /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/build/leo_exploration/build install --record /home/group4/LeoRoverAutonomousExploration/leo_exploration_ws/build/leo_exploration/install.log --single-version-externally-managed install_data
