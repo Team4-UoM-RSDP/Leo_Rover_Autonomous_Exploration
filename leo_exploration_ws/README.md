@@ -55,8 +55,12 @@ map ──(SLAM)──▶ odom ──(DiffDrive/firmware)──▶ base_footprin
 
 ```bash
 git clone https://github.com/Team4-UoM-RSDP/LeoRoverAutonomousExploration.git
-chmod +x run_sim.sh
-./run_sim.sh
+cd ~/LeoRoverAutonomousExploration && \
+pkill -f "gz sim" || true; pkill -f nav2 || true; pkill -f slam || true; pkill -f frontier || true; pkill -f rviz2 || true; \
+cd leo_exploration_ws/src/leo_exploration/scripts && chmod +x install_sim_deps.sh && ./install_sim_deps.sh && \
+cd ../../../ && colcon build --packages-select leo_exploration && \
+source install/setup.bash && \
+ros2 launch leo_exploration sim_exploration_launch.py
 ```
 
 ## Quick Start (Simulation)
