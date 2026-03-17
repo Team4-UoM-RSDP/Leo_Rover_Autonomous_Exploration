@@ -2,13 +2,14 @@
 """
 Leo Rover Complete Exploration Launch
 =====================================
-Launches (in order with timed delays):
+Launches (with startup gating for real hardware readiness):
   1. RPLidar A2M12  ──────────────── t=0 s
-  2. Static TF base_link → laser ─── t=0 s
-  3. SLAM Toolbox (online_async) ──── t=4 s
-  4. Nav2 navigation stack ─────────── t=10 s
-  5. Frontier Explorer node ────────── t=18 s
-  6. RViz2 ─────────────────────────── t=6 s
+  2. Static TF base_footprint → base_link / base_link → laser ─── t=0 s
+  3. EKF + startup readiness check ─── t=0 s
+  4. SLAM Toolbox (online_async) ───── after /scan + EKF TF are ready
+  5. Nav2 navigation stack ─────────── gated + delayed for SLAM warm-up
+  6. Frontier Explorer node ────────── gated + delayed for Nav2 warm-up
+  7. RViz2 ─────────────────────────── t=6 s
 
 Usage:
   ros2 launch leo_exploration exploration_launch.py
@@ -40,10 +41,10 @@ def generate_launch_description():
     pkg_nav2 = get_package_share_directory("nav2_bringup")
 
     # ── Config paths ─────────────────────────────────────────────────────────
-    nav2_params  = os.path.join(pkg_leo, "config", "nav2_params.yaml")
-    slam_params  = os.path.join(pkg_leo, "config", "slam_toolbox_params.yaml")
+    nav2_params  = os.path.join(pkg_leo, "config", "nav2_params_real.yaml")
+    slam_params  = os.path.join(pkg_leo, "config", "slam_toolbox_real.yaml")
     rviz_config  = os.path.join(pkg_leo, "config", "rviz2_config.rviz")
-    ekf_params   = os.path.join(pkg_leo, "config", "ekf.yaml")
+    ekf_params   = os.path.join(pkg_leo, "config", "ekf_real.yaml")
 
     # ── Launch arguments ─────────────────────────────────────────────────────
     use_sim_time_arg = DeclareLaunchArgument(
@@ -112,7 +113,6 @@ def generate_launch_description():
         name="ekf_filter_node",
         output="screen",
         parameters=[ekf_params, {"use_sim_time": use_sim_time}],
-        remappings=[("odometry/filtered", "odom_filtered")],
     )
 
     # =========================================================================
@@ -132,10 +132,10 @@ def generate_launch_description():
         output="screen",
     )
 
-    tf_base_footprint = Node(
+    tf_basefootprint_baselink = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
-        name="tf_base_footprint",
+        name="tf_basefootprint_baselink",
         arguments=[
             "--x",          "0.0",
             "--y",          "0.0",
@@ -150,7 +150,7 @@ def generate_launch_description():
     )
 
     # =========================================================================
-    # 3.  SLAM Toolbox  (launched after startup check verifies /scan and TF)
+    # 3.  SLAM Toolbox  (launched after startup check verifies /scan + EKF TF)
     # =========================================================================
     slam_launch = RegisterEventHandler(
         event_handler=OnProcessExit(
@@ -171,14 +171,14 @@ def generate_launch_description():
     )
 
     # =========================================================================
-    # 4.  Nav2 navigation stack  (delay 6 s after SLAM starts)
+    # 4.  Nav2 navigation stack  (extra margin after SLAM starts)
     # =========================================================================
     nav2_launch = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=startup_check_node,
             on_exit=[
                 TimerAction(
-                    period=6.0,
+                    period=8.0,
                     actions=[
                         LogInfo(msg="[Nav2] Starting navigation stack…"),
                         IncludeLaunchDescription(
@@ -198,14 +198,14 @@ def generate_launch_description():
     )
 
     # =========================================================================
-    # 5.  Frontier Explorer  (delay 14 s after SLAM starts)
+    # 5.  Frontier Explorer  (extra margin after Nav2 starts)
     # =========================================================================
     explorer_node = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=startup_check_node,
             on_exit=[
                 TimerAction(
-                    period=14.0,
+                    period=18.0,
                     actions=[
                         LogInfo(msg="[Explorer] Starting frontier exploration…"),
                         Node(
@@ -215,8 +215,9 @@ def generate_launch_description():
                             output="screen",
                             parameters=[{
                                 "use_sim_time":           use_sim_time,
-                                "robot_frame":            "base_footprint",
+                                "robot_frame":            "base_link",
                                 "map_frame":              "map",
+                                "cmd_vel_topic":          "/robot/cmd_vel",
                                 "min_frontier_size":      5,
                                 "obstacle_dist":          0.55,
                                 "scan_half_angle":        90.0,      # 180° front-only lidar
@@ -270,7 +271,7 @@ def generate_launch_description():
         startup_check_node,
         rplidar_node,
         tf_base_laser,
-        tf_base_footprint,
+        tf_basefootprint_baselink,
         ekf_node,
         slam_launch,
         nav2_launch,

@@ -10,11 +10,11 @@
     Wheel radius: 64.5 mm, width: 65 mm
 
   Plugins:
-    - DiffDrive  → subscribes /cmd_vel, publishes /odom + TF odom->base_link
+    - DiffDrive  → subscribes Gazebo /cmd_vel, publishes /odom with child base_footprint
     - GpuLidar   → publishes /scan (similar to RPLidar A2M12)
 
   Topics produced (via ros_gz_bridge):
-    /cmd_vel  (geometry_msgs/Twist)    ← Nav2 controller writes this
+    /sim/cmd_vel  (geometry_msgs/Twist) ← Nav2 / explorer write this via bridge
     /odom     (nav_msgs/Odometry)      → SLAM & Nav2 read this
     /scan     (sensor_msgs/LaserScan)  → SLAM reads this
     /clock    (rosgraph_msgs/Clock)    → sim time
@@ -229,9 +229,9 @@
   ═══════════════════════════════════════════════════════════════════ -->
 
   <!-- Differential Drive plugin
-       Subscribes:  /cmd_vel  (geometry_msgs/Twist via bridge)
+       Subscribes:  Gazebo /cmd_vel  (fed from ROS /sim/cmd_vel via bridge)
        Publishes:   /odom     (nav_msgs/Odometry via bridge)
-                    TF:       odom -> base_footprint (bridged as odom->base_link)
+                    child_frame_id: base_footprint
   -->
   <gazebo>
     <plugin filename="gz-sim-diff-drive-system"

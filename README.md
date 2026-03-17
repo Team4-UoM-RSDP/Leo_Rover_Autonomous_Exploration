@@ -45,7 +45,7 @@ A complete frontier-based autonomous exploration system for the [Leo Rover](http
                     │     frontier_explorer node         │
                     │  (shared between sim & real robot) │
                     └──────┬──────────────┬──────────────┘
-                           │ /navigate_to_pose    │ /cmd_vel
+                           │ /navigate_to_pose    │ /robot/cmd_vel or /sim/cmd_vel
                     ┌──────▼──────┐      ┌────────▼────────┐
                     │  Nav2 Stack │      │ Controller /     │
                     │  (planner,  │      │ Gazebo DiffDrive │
@@ -67,7 +67,7 @@ map ──(SLAM)──▶ odom ──(EKF / DiffDrive)──▶ base_footprint �
 | Component | Simulation | Real Robot |
 |---|---|---|
 | Lidar | Gazebo GPU lidar plugin → ros_gz_bridge → `/scan` | RPLidar A2M12 → `/scan` |
-| Odometry | Gazebo DiffDrive → ros_gz_bridge → `/odom` + TF | Leo firmware → `/odom` + TF |
+| Odometry | Gazebo DiffDrive → ros_gz_bridge → `/odom` | Leo firmware → `/odom` |
 | IMU | Gazebo IMU plugin → ros_gz_bridge → `/imu` | Leo firmware → `/imu` |
 | TF (static) | `robot_state_publisher` from URDF | Static TF launch node |
 | Localisation | EKF (`robot_localization`): fuses `/odom` velocity + `/imu` heading | Same |
@@ -94,7 +94,7 @@ Gazebo Harmonic
         │
   Nav2 (navigate_to_pose action)
         │
-  /cmd_vel ──▶ ros_gz_bridge ──▶ Gazebo DiffDrive
+  /sim/cmd_vel ──▶ ros_gz_bridge ──▶ Gazebo DiffDrive
 ```
 
 ---
@@ -115,9 +115,15 @@ LeoRoverAutonomousExploration/
 │           │   ├── sim_exploration_launch.py   ← Simulation launch (Gazebo + full stack)
 │           │   └── exploration_launch.py       ← Real robot launch (RPLidar + stack)
 │           ├── config/
-│           │   ├── nav2_params.yaml       ← Nav2 controller / planner / costmap
-│           │   ├── slam_toolbox_params.yaml ← SLAM Toolbox settings
-│           │   ├── ekf.yaml               ← EKF odometry fusion
+│           │   ├── nav2_params_real.yaml  ← Real-robot Nav2 parameters
+│           │   ├── nav2_params_sim.yaml   ← Simulation Nav2 parameters
+│           │   ├── slam_toolbox_real.yaml ← Real-robot SLAM parameters
+│           │   ├── slam_toolbox_sim.yaml  ← Simulation SLAM parameters
+│           │   ├── ekf_real.yaml          ← Real-robot EKF parameters
+│           │   ├── ekf_sim.yaml           ← Simulation EKF parameters
+│           │   ├── nav2_params.yaml       ← Real-safe compatibility copy
+│           │   ├── slam_toolbox_params.yaml ← Real-safe compatibility copy
+│           │   ├── ekf.yaml               ← Real-safe compatibility copy
 │           │   ├── ros_gz_bridge.yaml     ← Gazebo ↔ ROS topic bridge
 │           │   └── rviz2_config.rviz      ← RViz2 visualisation layout
 │           ├── urdf/
@@ -256,7 +262,7 @@ ros2 launch leo_exploration exploration_launch.py laser_height:=0.12
 
 ## Startup Timeline
 
-All components launch on a timed schedule to guarantee each dependency is ready before its consumers start.
+Simulation uses timed sequencing; the real-robot launch uses `startup_check` plus timed warm-up delays after sensor and TF readiness.
 
 ### Simulation
 
@@ -264,7 +270,7 @@ All components launch on a timed schedule to guarantee each dependency is ready 
 |---|---|---|
 | t = 0 s | Gazebo Harmonic + `robot_state_publisher` | Physics engine, URDF → TF |
 | t = 5 s | Spawn Leo Rover | Place robot model in Gazebo world |
-| t = 7 s | `ros_gz_bridge` | Bridge `/scan`, `/odom`, `/cmd_vel`, `/tf`, `/clock`, `/imu` |
+| t = 7 s | `ros_gz_bridge` | Bridge `/scan`, `/odom`, `/sim/cmd_vel`, `/tf`, `/clock`, `/imu` |
 | t = 9 s | EKF (`robot_localization`) | Fuse `/odom` + `/imu` → odom → base_footprint TF |
 | t = 12 s | SLAM Toolbox | Online async mapping from `/scan` |
 | t = 15 s | RViz2 | Visualisation |
@@ -275,11 +281,12 @@ All components launch on a timed schedule to guarantee each dependency is ready 
 
 | Time | Component |
 |---|---|
-| t = 0 s | RPLidar A2M12 node + static TF + EKF |
-| t = 4 s | SLAM Toolbox |
-| t = 6 s | RViz2 |
-| t = 10 s | Nav2 stack |
-| t = 18 s | `frontier_explorer` |
+| t = 0 s | RPLidar A2M12 + static TF (`base_footprint → base_link`, `base_link → laser`) + EKF + startup check |
+| ready gate | `startup_check` waits for `/scan`, `/odometry/filtered`, and TF `odom → base_link` |
+| gate + 0 s | SLAM Toolbox |
+| gate + 6 s | RViz2 |
+| gate + 8 s | Nav2 stack |
+| gate + 18 s | `frontier_explorer` |
 
 ---
 
@@ -360,7 +367,7 @@ All parameters can be overridden in the launch file or via `ros2 param set`.
 | `save_map_on_complete` | `true` | Whether to save the map on completion |
 | `map_save_path` | `/tmp/leo_explored_map` | Path prefix for saved map files |
 
-### Nav2 Configuration Highlights (`nav2_params.yaml`)
+### Nav2 Configuration Highlights (`nav2_params_real.yaml` / `nav2_params_sim.yaml`)
 
 | Setting | Value |
 |---|---|
@@ -372,23 +379,24 @@ All parameters can be overridden in the launch file or via `ros2 param set`.
 | Goal tolerance (XY) | 0.30 m |
 | Goal tolerance (yaw) | 0.30 rad |
 
-### SLAM Toolbox Configuration Highlights (`slam_toolbox_params.yaml`)
+### SLAM Toolbox Configuration Highlights (`slam_toolbox_real.yaml` / `slam_toolbox_sim.yaml`)
 
 | Setting | Value |
 |---|---|
 | Mode | Online async |
 | Solver | Ceres (SPARSE_NORMAL_CHOLESKY) |
+| Base frame | `base_link` |
 | Map resolution | 0.05 m/cell |
 | Max laser range | 12.0 m |
 | Minimum travel distance | 0.3 m |
 | Loop closure | Enabled |
 
-### EKF Configuration (`ekf.yaml`)
+### EKF Configuration (`ekf_real.yaml` / `ekf_sim.yaml`)
 
 | Setting | Value |
 |---|---|
 | Frequency | 30 Hz |
-| Odom sensor | `/odom` — uses velocity (vx, vy, vyaw) |
+| Odom sensor | `/odom` — uses velocity (vx, vyaw) |
 | IMU sensor | `/imu` — uses absolute yaw + yaw velocity |
 | Output TF | odom → base_footprint |
 
@@ -463,7 +471,7 @@ The URDF (`urdf/leo_rover.urdf`) describes the full Leo Rover kinematic and dyna
 
 | Plugin | Function |
 |---|---|
-| `gz-sim-diff-drive-system` | Differential drive: subscribes to `/cmd_vel`, publishes `/odom` + TF |
+| `gz-sim-diff-drive-system` | Differential drive: subscribes to Gazebo `/cmd_vel` fed from ROS `/sim/cmd_vel`, publishes `/odom` |
 | `gz-sim-joint-state-publisher-system` | Publishes `/joint_states` |
 | IMU sensor | Publishes `/imu_gz` at 50 Hz (with noise) |
 | GPU Lidar sensor | Publishes `/scan_gz` — 360 rays, 0.15–12.0 m range, 10 Hz |

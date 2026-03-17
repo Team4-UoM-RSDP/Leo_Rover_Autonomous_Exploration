@@ -10,18 +10,20 @@ Everything is provided by this package: own URDF, own world, own bridge config.
 Only apt dependencies needed:
   sudo apt install ros-jazzy-ros-gz ros-jazzy-ros-gz-bridge \
     ros-jazzy-ros-gz-sim ros-jazzy-slam-toolbox \
-    ros-jazzy-nav2-bringup ros-jazzy-robot-state-publisher \
+    ros-jazzy-nav2-bringup ros-jazzy-robot-localization \
+    ros-jazzy-robot-state-publisher \
     ros-jazzy-joint-state-publisher
 
 What this launch does (in order):
   t=0s   Gazebo Harmonic physics server (headless or GUI)
-  t=0s   robot_state_publisher  (publishes URDF + static TF base_link->laser)
-  t=3s   Spawn Leo Rover URDF into Gazebo
-  t=4s   ros_gz_bridge (/scan, /odom, /cmd_vel, /tf, /clock)
-  t=8s   SLAM Toolbox online_async
-  t=10s  RViz2
-  t=16s  Nav2 navigation stack
-  t=26s  Frontier Explorer node
+  t=0s   robot_state_publisher  (publishes URDF + static TF base_footprint->base_link->laser)
+  t=5s   Spawn Leo Rover URDF into Gazebo
+  t=7s   ros_gz_bridge (/scan, /odom, /sim/cmd_vel, /tf, /clock)
+  t=9s   EKF
+  t=12s  SLAM Toolbox online_async
+  t=15s  RViz2
+  t=22s  Nav2 navigation stack
+  t=40s  Frontier Explorer node
 
 Usage:
   ros2 launch leo_exploration sim_exploration_launch.py
@@ -56,16 +58,15 @@ def generate_launch_description():
 
     pkg = get_package_share_directory("leo_exploration")
     pkg_slm  = get_package_share_directory("slam_toolbox")
-    pkg_nav2 = get_package_share_directory("nav2_bringup")
 
     # ── File paths ───────────────────────────────────────────────────────────
     urdf_file    = os.path.join(pkg, "urdf",   "leo_rover.urdf")
     world_file   = os.path.join(pkg, "worlds", "exploration_test.world")
-    nav2_params  = os.path.join(pkg, "config", "nav2_params.yaml")
-    slam_params  = os.path.join(pkg, "config", "slam_toolbox_params.yaml")
+    nav2_params  = os.path.join(pkg, "config", "nav2_params_sim.yaml")
+    slam_params  = os.path.join(pkg, "config", "slam_toolbox_sim.yaml")
     rviz_config  = os.path.join(pkg, "config", "rviz2_config.rviz")
     bridge_cfg   = os.path.join(pkg, "config", "ros_gz_bridge.yaml")
-    ekf_params   = os.path.join(pkg, "config", "ekf.yaml")
+    ekf_params   = os.path.join(pkg, "config", "ekf_sim.yaml")
 
     with open(urdf_file, "r") as f:
         robot_description = f.read()
@@ -154,7 +155,7 @@ def generate_launch_description():
 
     # =========================================================================
     # 4.  ros_gz_bridge  (t = 7 s — after robot spawned)
-    #     Bridges: /scan, /odom, /cmd_vel, /tf, /clock, /joint_states
+    #     Bridges: /scan, /odom, /sim/cmd_vel, /tf, /clock, /joint_states
     # =========================================================================
     bridge_node = TimerAction(
         period=7.0,
@@ -187,7 +188,6 @@ def generate_launch_description():
                 name="ekf_filter_node",
                 output="screen",
                 parameters=[ekf_params, {"use_sim_time": True}],
-                remappings=[("odometry/filtered", "odom_filtered")],
             ),
         ],
     )
@@ -248,6 +248,10 @@ def generate_launch_description():
                 name="controller_server",
                 output="screen",
                 parameters=[nav2_params, {"use_sim_time": True}],
+                remappings=[
+                    ("cmd_vel", "/sim/cmd_vel"),
+                    ("/cmd_vel", "/sim/cmd_vel"),
+                ],
             ),
 
             # ── Planner Server (computes paths) ──
@@ -266,6 +270,10 @@ def generate_launch_description():
                 name="behavior_server",
                 output="screen",
                 parameters=[nav2_params, {"use_sim_time": True}],
+                remappings=[
+                    ("cmd_vel", "/sim/cmd_vel"),
+                    ("/cmd_vel", "/sim/cmd_vel"),
+                ],
             ),
 
             # ── BT Navigator (orchestrates navigation via behavior tree) ──
@@ -314,6 +322,7 @@ def generate_launch_description():
                     "use_sim_time":          True,
                     "robot_frame":           "base_link",
                     "map_frame":             "map",
+                    "cmd_vel_topic":         "/sim/cmd_vel",
                     "min_frontier_size":     5,
                     "obstacle_dist":         0.55,
                     "scan_half_angle":       90.0,       # 180° front-only lidar
@@ -367,4 +376,3 @@ def generate_launch_description():
         nav2_nodes,
         explorer_node,
     ])
-

@@ -31,13 +31,13 @@
   direction: GZ_TO_ROS
 
 # ── Command velocity ──────────────────────────────────────────────────────────
-- ros_topic_name: /cmd_vel
+- ros_topic_name: /sim/cmd_vel
   gz_topic_name: /cmd_vel
   ros_type_name: geometry_msgs/msg/Twist
   gz_type_name: gz.msgs.Twist
   direction: ROS_TO_GZ
 
-# ── TF (from DiffDrive plugin: odom -> base_link) ─────────────────────────────
+# ── TF (joint-state / model pose traffic, when present) ───────────────────────
 - ros_topic_name: /tf
   gz_topic_name: /tf
   ros_type_name: tf2_msgs/msg/TFMessage

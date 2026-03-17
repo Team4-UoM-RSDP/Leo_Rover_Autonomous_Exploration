@@ -418,7 +418,7 @@ class FrontierExplorer(Node):
             Bool, "/explore/enable", self._enable_cb, 10)
 
         # Publishers
-        self._cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self._cmd_vel_pub = self.create_publisher(Twist, self.p_cmd_vel_topic, 10)
         self._viz_pub = self.create_publisher(MarkerArray, "/frontiers", 10)
 
         # Nav2 action client
@@ -446,12 +446,16 @@ class FrontierExplorer(Node):
             "║  Publish False to /explore/enable to pause.       ║\n"
             "╚══════════════════════════════════════════════════╝"
         )
+        self.get_logger().info(
+            f"Velocity commands will be published on {self.p_cmd_vel_topic}"
+        )
 
     # -------------------------------------------------------------------------
     #  Parameters
     # -------------------------------------------------------------------------
 
     def _declare_params(self) -> None:
+        self.declare_parameter("cmd_vel_topic",       "/cmd_vel")
         self.declare_parameter("robot_frame",          "base_link")
         self.declare_parameter("map_frame",            "map")
         self.declare_parameter("min_frontier_size",    5)
@@ -477,6 +481,7 @@ class FrontierExplorer(Node):
 
     def _load_params(self) -> None:
         g = self.get_parameter
+        self.p_cmd_vel_topic  = g("cmd_vel_topic").value
         self.p_robot_frame     = g("robot_frame").value
         self.p_map_frame       = g("map_frame").value
         self.p_min_frontier    = g("min_frontier_size").value
