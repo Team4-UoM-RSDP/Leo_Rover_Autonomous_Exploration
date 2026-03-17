@@ -24,7 +24,9 @@ from launch.actions import (
     IncludeLaunchDescription,
     LogInfo,
     TimerAction,
+    RegisterEventHandler,
 )
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -114,83 +116,133 @@ def generate_launch_description():
     )
 
     # =========================================================================
-    # 3.  SLAM Toolbox  (delay 4 s to let lidar start publishing /scan)
+    # 2.75. System Monitor, Startup Check & Static TF: base_footprint → base_link
     # =========================================================================
-    slam_launch = TimerAction(
-        period=4.0,
-        actions=[
-            LogInfo(msg="[SLAM] Starting slam_toolbox online_async…"),
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    os.path.join(pkg_slm, "launch", "online_async_launch.py")
-                ),
-                launch_arguments={
-                    "use_sim_time":      use_sim_time,
-                    "slam_params_file":  slam_params,
-                }.items(),
-            ),
+    system_monitor_node = Node(
+        package="leo_exploration",
+        executable="system_monitor",
+        name="system_monitor",
+        output="screen",
+    )
+
+    startup_check_node = Node(
+        package="leo_exploration",
+        executable="startup_check",
+        name="startup_check",
+        output="screen",
+    )
+
+    tf_base_footprint = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="tf_base_footprint",
+        arguments=[
+            "--x",          "0.0",
+            "--y",          "0.0",
+            "--z",          "0.0645",
+            "--yaw",        "0.0",
+            "--pitch",      "0.0",
+            "--roll",       "0.0",
+            "--frame-id",   "base_footprint",
+            "--child-frame-id", "base_link",
         ],
+        output="screen",
     )
 
     # =========================================================================
-    # 4.  Nav2 navigation stack  (delay 10 s to let SLAM initialise TF tree)
+    # 3.  SLAM Toolbox  (launched after startup check verifies /scan and TF)
     # =========================================================================
-    nav2_launch = TimerAction(
-        period=10.0,
-        actions=[
-            LogInfo(msg="[Nav2] Starting navigation stack…"),
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    os.path.join(pkg_nav2, "launch", "navigation_launch.py")
+    slam_launch = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=startup_check_node,
+            on_exit=[
+                LogInfo(msg="[SLAM] Starting slam_toolbox online_async…"),
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(
+                        os.path.join(pkg_slm, "launch", "online_async_launch.py")
+                    ),
+                    launch_arguments={
+                        "use_sim_time":      use_sim_time,
+                        "slam_params_file":  slam_params,
+                    }.items(),
                 ),
-                launch_arguments={
-                    "use_sim_time":  use_sim_time,
-                    "params_file":   nav2_params,
-                    "autostart":     "true",
-                }.items(),
-            ),
-        ],
+            ]
+        )
     )
 
     # =========================================================================
-    # 5.  Frontier Explorer  (delay 18 s to let Nav2 fully initialise)
+    # 4.  Nav2 navigation stack  (delay 6 s after SLAM starts)
     # =========================================================================
-    explorer_node = TimerAction(
-        period=18.0,
-        actions=[
-            LogInfo(msg="[Explorer] Starting frontier exploration…"),
-            Node(
-                package="leo_exploration",
-                executable="frontier_explorer",
-                name="frontier_explorer",
-                output="screen",
-                parameters=[{
-                    "use_sim_time":           use_sim_time,
-                    "robot_frame":            "base_link",
-                    "map_frame":              "map",
-                    "min_frontier_size":      5,
-                    "obstacle_dist":          0.55,
-                    "scan_half_angle":        90.0,      # 180° front-only lidar
-                    "safety_radius":          0.50,      # full 360° safety perimeter
-                    "nav_timeout":            35.0,
-                    "init_forward_speed":     0.15,      # no spin, drive forward
-                    "init_forward_duration":  3.0,
-                    "backup_speed":          -0.18,
-                    "backup_duration":        1.8,
-                    "avoid_curve_speed":      0.10,      # gentle curve, no spin
-                    "avoid_curve_angular":    0.5,
-                    "avoid_curve_duration":   2.0,
-                    "recov_forward_speed":    0.12,      # forward drive, no spin
-                    "recov_forward_duration": 4.0,
-                    "max_consec_fail":        4,
-                    "costmap_clear_every":    3,
-                    "complete_no_frontier":   8,
-                    "log_interval":          12.0,
-                    "save_map_on_complete":   True,
-                    "map_save_path":          "/tmp/leo_explored_map",
-                }],
-            ),
-        ],
+    nav2_launch = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=startup_check_node,
+            on_exit=[
+                TimerAction(
+                    period=6.0,
+                    actions=[
+                        LogInfo(msg="[Nav2] Starting navigation stack…"),
+                        IncludeLaunchDescription(
+                            PythonLaunchDescriptionSource(
+                                os.path.join(pkg_nav2, "launch", "navigation_launch.py")
+                            ),
+                            launch_arguments={
+                                "use_sim_time":  use_sim_time,
+                                "params_file":   nav2_params,
+                                "autostart":     "true",
+                            }.items(),
+                        ),
+                    ]
+                )
+            ]
+        )
+    )
+
+    # =========================================================================
+    # 5.  Frontier Explorer  (delay 14 s after SLAM starts)
+    # =========================================================================
+    explorer_node = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=startup_check_node,
+            on_exit=[
+                TimerAction(
+                    period=14.0,
+                    actions=[
+                        LogInfo(msg="[Explorer] Starting frontier exploration…"),
+                        Node(
+                            package="leo_exploration",
+                            executable="frontier_explorer",
+                            name="frontier_explorer",
+                            output="screen",
+                            parameters=[{
+                                "use_sim_time":           use_sim_time,
+                                "robot_frame":            "base_footprint",
+                                "map_frame":              "map",
+                                "min_frontier_size":      5,
+                                "obstacle_dist":          0.55,
+                                "scan_half_angle":        90.0,      # 180° front-only lidar
+                                "safety_radius":          0.50,      # full 360° safety perimeter
+                                "nav_timeout":            35.0,
+                                "init_forward_speed":     0.15,      # no spin, drive forward
+                                "init_forward_duration":  3.0,
+                                "backup_speed":          -0.18,
+                                "backup_duration":        1.8,
+                                "avoid_curve_speed":      0.10,      # gentle curve, no spin
+                                "avoid_curve_angular":    0.5,
+                                "avoid_curve_duration":   2.0,
+                                "recov_forward_speed":    0.12,      # forward drive, no spin
+                                "recov_forward_duration": 4.0,
+                                "max_consec_fail":        4,
+                                "costmap_clear_every":    3,
+                                "complete_no_frontier":   8,
+                                "log_interval":          12.0,
+                                "save_map_on_complete":   True,
+                                "map_save_path":          "/tmp/leo_explored_map",
+                            }],
+                        )
+                    ]
+                )
+            ]
+        )
     )
 
     # =========================================================================
@@ -214,8 +266,11 @@ def generate_launch_description():
         serial_port_arg,
         laser_height_arg,
         LogInfo(msg="╔══ Leo Rover Exploration System Starting ══╗"),
+        system_monitor_node,
+        startup_check_node,
         rplidar_node,
         tf_base_laser,
+        tf_base_footprint,
         ekf_node,
         slam_launch,
         nav2_launch,

@@ -33,6 +33,8 @@ setup(
     entry_points={
         "console_scripts": [
             "frontier_explorer = leo_exploration.frontier_explorer:main",
+            "startup_check = leo_exploration.startup_check:main",
+            "system_monitor = leo_exploration.system_monitor:main",
         ],
     },
 )
