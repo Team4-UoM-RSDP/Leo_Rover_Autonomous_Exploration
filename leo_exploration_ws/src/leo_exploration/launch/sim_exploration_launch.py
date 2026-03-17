@@ -44,6 +44,7 @@ from launch.actions import (
     IncludeLaunchDescription,
     LogInfo,
     TimerAction,
+    SetEnvironmentVariable,
 )
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -78,6 +79,8 @@ def generate_launch_description():
                                          description="Gazebo world file path")
     spawn_x_arg  = DeclareLaunchArgument("spawn_x",  default_value="0.0")
     spawn_y_arg  = DeclareLaunchArgument("spawn_y",  default_value="0.0")
+    domain_id_arg = DeclareLaunchArgument("domain_id", default_value="2",
+                                          description="ROS_DOMAIN_ID to isolate simulation from real robot")
 
     gz_gui   = LaunchConfiguration("gz_gui")
     rviz     = LaunchConfiguration("rviz")
@@ -342,6 +345,8 @@ def generate_launch_description():
         world_arg,
         spawn_x_arg,
         spawn_y_arg,
+        domain_id_arg,
+        SetEnvironmentVariable("ROS_DOMAIN_ID", LaunchConfiguration("domain_id")),
 
         LogInfo(msg="\n"
                 "╔══════════════════════════════════════════════════╗\n"
