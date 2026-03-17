@@ -1,2 +1,0 @@
-[console_scripts]
-frontier_explorer = leo_exploration.frontier_explorer:main
