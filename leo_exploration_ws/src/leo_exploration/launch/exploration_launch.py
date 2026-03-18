@@ -217,7 +217,7 @@ def generate_launch_description():
                                 "use_sim_time":           use_sim_time,
                                 "robot_frame":            "base_link",
                                 "map_frame":              "map",
-                                "cmd_vel_topic":          "/robot/cmd_vel",
+                                "cmd_vel_topic":          "/cmd_vel",
                                 "min_frontier_size":      5,
                                 "obstacle_dist":          0.55,
                                 "scan_half_angle":        90.0,      # 180° front-only lidar
