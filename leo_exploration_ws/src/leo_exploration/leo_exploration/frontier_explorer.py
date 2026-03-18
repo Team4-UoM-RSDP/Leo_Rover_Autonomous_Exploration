@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
 Leo Rover Frontier-Based Autonomous Exploration Node
-ROS2 Jazzy  |  v3.0  —  Wavefront Frontier Detection (WFD)
+ROS2 Jazzy  |  v3.1  —  Wavefront Frontier Detection (WFD)
 
-v3.0 changes:
+v3.1 changes:
+  ─ 120° front-sector navigation check (scan_half_angle=60° by default).
+  ─ 360° safety perimeter now includes:
+      • self-clear radius filtering
+      • rear exclusion wedge filtering
+      • debounce across multiple control cycles
+  ─ Avoidance completion no longer counts as an automatic navigation failure.
+  ─ Fixed several map-boundary / neighbor edge cases in WFD utilities.
+  ─ Frontier size scoring now uses the real cluster size.
   ─ WFD BFS algorithm ported from nav2_wavefront_frontier_exploration
     (replaces numpy dilation-based frontier detection).
   ─ INIT_SPIN removed: robot drives straight forward on startup (no spin).
@@ -103,7 +111,7 @@ class OccupancyGrid2d:
         mx = int((wx - self.map.info.origin.position.x) / self.map.info.resolution)
         my = int((wy - self.map.info.origin.position.y) / self.map.info.resolution)
 
-        if my > self.map.info.height or mx > self.map.info.width:
+        if my >= self.map.info.height or mx >= self.map.info.width:
             raise Exception("Out of bounds")
 
         return (mx, my)
@@ -135,8 +143,8 @@ class FrontierCache:
         self.cache[idx] = pt
         return pt
 
-    def _cantorHash(self, x: int, y: int) -> float:
-        return (((x + y) * (x + y + 1)) / 2) + y
+    def _cantorHash(self, x: int, y: int) -> int:
+        return ((x + y) * (x + y + 1) // 2) + y
 
     def clear(self) -> None:
         self.cache = {}
@@ -164,11 +172,13 @@ def _getNeighbors(
     costmap: OccupancyGrid2d,
     fCache: FrontierCache,
 ) -> List[FrontierPoint]:
-    """8-connected neighbors within map bounds."""
+    """8-connected neighbors within map bounds (excluding the point itself)."""
     neighbors = []
     for x in range(point.mapX - 1, point.mapX + 2):
         for y in range(point.mapY - 1, point.mapY + 2):
-            if 0 < x < costmap.getSizeX() and 0 < y < costmap.getSizeY():
+            if x == point.mapX and y == point.mapY:
+                continue
+            if 0 <= x < costmap.getSizeX() and 0 <= y < costmap.getSizeY():
                 neighbors.append(fCache.getPoint(x, y))
     return neighbors
 
@@ -220,10 +230,10 @@ def _getFrontier(
     pose_x: float, pose_y: float,
     costmap: OccupancyGrid2d,
     logger,
-) -> List[Tuple[float, float]]:
+) -> List[Tuple[float, float, int]]:
     """
     Wavefront Frontier Detection (WFD) algorithm.
-    Returns a list of frontier centroid world coordinates.
+    Returns a list of (centroid_x, centroid_y, cluster_size) tuples in world coordinates.
     """
     fCache = FrontierCache()
     fCache.clear()
@@ -239,7 +249,7 @@ def _getFrontier(
     start.classification = PointClassification.MapOpen.value
     mapPointQueue = [start]
 
-    frontiers: List[Tuple[float, float]] = []
+    frontiers: List[Tuple[float, float, int]] = []
 
     while len(mapPointQueue) > 0:
         p = mapPointQueue.pop(0)
@@ -280,7 +290,6 @@ def _getFrontier(
                     q.classification | PointClassification.FrontierClosed.value
                 )
 
-            # Convert frontier cluster to world coords and compute centroid
             newFrontierCoords = []
             for fp in newFrontier:
                 fp.classification = (
@@ -288,8 +297,9 @@ def _getFrontier(
                 )
                 newFrontierCoords.append(costmap.mapToWorld(fp.mapX, fp.mapY))
 
-            if len(newFrontier) > MIN_FRONTIER_SIZE:
-                frontiers.append(_centroid(newFrontierCoords))
+            if len(newFrontier) > 0:
+                cx, cy = _centroid(newFrontierCoords)
+                frontiers.append((cx, cy, len(newFrontier)))
 
         for v in _getNeighbors(p, costmap, fCache):
             if v.classification & (
@@ -392,6 +402,9 @@ class FrontierExplorer(Node):
         # Ensure COMPLETE executes exactly once
         self._completed: bool = False
 
+        # Debounce for 360° safety perimeter triggers
+        self._safety_hits: int = 0
+
         # Service readiness flags (updated by 1 Hz probe timer)
         self._svc_local_ok: bool = False
         self._svc_global_ok: bool = False
@@ -461,7 +474,10 @@ class FrontierExplorer(Node):
         self.declare_parameter("min_frontier_size",    5)
         self.declare_parameter("obstacle_dist",        0.45)
         self.declare_parameter("scan_half_angle",      60.0)    # degrees — 120° front scan
-        self.declare_parameter("safety_radius",        0.35)    # full-360° safety perimeter
+        self.declare_parameter("safety_radius",        0.35)    # 360° safety perimeter trigger
+        self.declare_parameter("safety_self_clear_radius", 0.30) # ignore returns inside robot/self envelope
+        self.declare_parameter("safety_rear_exclusion_deg", 20.0) # exclude narrow rear wedge
+        self.declare_parameter("safety_trigger_count",  2)       # debounce cycles before emergency avoid
         self.declare_parameter("nav_timeout",          35.0)    # s
         self.declare_parameter("init_forward_speed",   0.15)    # m/s
         self.declare_parameter("init_forward_duration", 3.0)    # s
@@ -488,6 +504,9 @@ class FrontierExplorer(Node):
         self.p_obs_dist        = g("obstacle_dist").value
         self.p_scan_half_angle = math.radians(g("scan_half_angle").value)
         self.p_safety_radius   = g("safety_radius").value
+        self.p_safety_self_clear_radius = g("safety_self_clear_radius").value
+        self.p_safety_rear_exclusion = math.radians(g("safety_rear_exclusion_deg").value)
+        self.p_safety_trigger_count = int(g("safety_trigger_count").value)
         self.p_nav_timeout     = g("nav_timeout").value
         self.p_fwd_speed       = g("init_forward_speed").value
         self.p_fwd_duration    = g("init_forward_duration").value
@@ -567,8 +586,8 @@ class FrontierExplorer(Node):
 
     def _obstacle_in_sector(self) -> Tuple[bool, float]:
         """
-        180° front-only obstacle check.
-        Only considers laser readings within ±scan_half_angle (default ±90°).
+        Front-sector obstacle check.
+        Only considers laser readings within ±scan_half_angle (default ±60° = 120° total).
         This filters out rear readings caused by structural pillars on the
         real Leo Rover chassis.
         """
@@ -592,13 +611,9 @@ class FrontierExplorer(Node):
 
     def _check_safety_perimeter(self) -> Tuple[bool, float, float]:
         """
-        Full 360° safety perimeter check.
-        Returns (is_danger, min_distance, danger_angle_rad).
+        360° safety perimeter check with self-filtering and a narrow rear exclusion wedge.
 
-        This is the FIRST line of defense — it runs every control-loop
-        iteration regardless of the current state.  If ANY lidar reading
-        is closer than ``safety_radius``, the robot must immediately stop
-        and enter avoidance.
+        Returns (is_danger, min_distance, danger_angle_rad).
         """
         scan = self.latest_scan
         if scan is None:
@@ -609,7 +624,16 @@ class FrontierExplorer(Node):
             np.arange(len(ranges), dtype=np.float32) * scan.angle_increment
             + scan.angle_min
         )
+
         valid = np.isfinite(ranges) & (ranges > 0.01)
+
+        # Ignore returns inside the robot / lidar mount / near-self envelope
+        valid &= (ranges > self.p_safety_self_clear_radius)
+
+        # Exclude a narrow wedge directly behind the robot to avoid rear self-reflections
+        rear_mask = np.abs(np.abs(angles) - math.pi) < self.p_safety_rear_exclusion
+        valid &= (~rear_mask)
+
         if not np.any(valid):
             return False, float("inf"), 0.0
 
@@ -620,6 +644,7 @@ class FrontierExplorer(Node):
         min_angle = float(valid_angles[min_idx])
 
         return min_d < self.p_safety_radius, min_d, min_angle
+
 
     def _stop(self) -> None:
         self._cmd_vel_pub.publish(Twist())
@@ -675,14 +700,16 @@ class FrontierExplorer(Node):
         og2d = OccupancyGrid2d(self.map_data)
 
         # Run WFD BFS
-        centroids = _getFrontier(rx, ry, og2d, self.get_logger())
+        frontier_clusters = _getFrontier(rx, ry, og2d, self.get_logger())
 
-        # Convert WFD centroids to Frontier objects, applying inflation filter
+        # Convert WFD centroids to Frontier objects, applying cluster-size and inflation filters
         frontiers: List[Frontier] = []
-        for (wx, wy) in centroids:
+        for (wx, wy, cluster_size) in frontier_clusters:
+            if cluster_size < self.p_min_frontier:
+                continue
             if self._frontier_in_inflation(wx, wy):
                 continue
-            frontiers.append(Frontier(wx, wy, size=MIN_FRONTIER_SIZE + 1))
+            frontiers.append(Frontier(wx, wy, size=cluster_size))
 
         return frontiers
 
@@ -926,10 +953,15 @@ class FrontierExplorer(Node):
         now = self._now_sec()
 
         # ── Global safety perimeter (runs in EVERY state except AVOIDING
-        #    and COMPLETE) ── full 360° check
+        #    and COMPLETE) ── 360° check with debounce
         if self.state not in (State.AVOIDING, State.COMPLETE):
             danger, s_dist, s_angle = self._check_safety_perimeter()
             if danger:
+                self._safety_hits += 1
+            else:
+                self._safety_hits = 0
+
+            if self._safety_hits >= self.p_safety_trigger_count:
                 self.get_logger().warn(
                     f"⚠ Safety perimeter breach! Obstacle at {s_dist:.2f}m "
                     f"angle={math.degrees(s_angle):.0f}° — emergency avoidance"
@@ -946,9 +978,9 @@ class FrontierExplorer(Node):
                 self._avoid_phase = 0
                 self._recov_t0 = None
                 self._fwd_t0 = None
+                self._safety_hits = 0
                 self.state = State.AVOIDING
                 return
-
         {
             State.INIT_FORWARD:    self._state_init_forward,
             State.SELECT_FRONTIER: self._state_select,
@@ -982,6 +1014,7 @@ class FrontierExplorer(Node):
             )
             self._stop()
             self._fwd_t0 = None
+            self._safety_hits = 0
             self.state = State.SELECT_FRONTIER
             return
 
@@ -990,6 +1023,7 @@ class FrontierExplorer(Node):
         else:
             self._stop()
             self._fwd_t0 = None
+            self._safety_hits = 0
             self.get_logger().info("Init forward done — starting exploration")
             self.state = State.SELECT_FRONTIER
 
@@ -1147,13 +1181,17 @@ class FrontierExplorer(Node):
             # Phase 1: gentle curve (forward + angular) — steer AWAY from obstacle
             elapsed = now - (self._avoid_t0 or now)
             if elapsed < self.p_curve_dur:
-                self._drive(self.p_curve_speed, self.p_curve_angular * self._avoid_direction)
+                self._drive(
+                    self.p_curve_speed,
+                    self.p_curve_angular * self._avoid_direction
+                )
             else:
                 self._stop()
+                self._safety_hits = 0
                 self.get_logger().info("Avoidance manoeuvre complete (no spin)")
-                self._clear_costmaps()
-                self.consec_fail += 1
+                # Do not count every successful avoidance as a hard navigation failure.
                 self.state = State.SELECT_FRONTIER
+
 
     # -------------------------------------------------------------------------
     #  State: RECOVERING  (slow forward drive — NO spin)
@@ -1166,6 +1204,7 @@ class FrontierExplorer(Node):
         """
         if self._recov_t0 is None:
             self._recov_t0 = now
+            self._safety_hits = 0
             self._clear_costmaps()
             self.get_logger().info(
                 f"Recovery: driving forward at {self.p_recov_speed} m/s "
@@ -1182,6 +1221,7 @@ class FrontierExplorer(Node):
             self._recov_t0 = None
             self._avoid_t0 = self._now_sec()
             self._avoid_phase = 0
+            self._safety_hits = 0
             self.state = State.AVOIDING
             return
 
